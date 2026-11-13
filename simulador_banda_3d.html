@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simulador banda IoT - ESP32</title>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.4/dist/mqtt.min.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:system-ui,sans-serif;max-width:1040px;margin:0 auto;padding:14px;background:#0a0f1c;color:#e6ebf5}
+  h1{font-size:1.25rem;margin:4px 0 10px}
+  h2{font-size:.9rem;margin:0 0 8px;color:#8fc2ff;letter-spacing:.3px}
+  canvas{width:100%;aspect-ratio:1000/440;border-radius:14px;display:block;border:1px solid #243049}
+  .hud{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .pill{background:#141c30;border:1px solid #243049;border-radius:20px;padding:5px 12px;font-size:.8rem}
+  .pill b{margin-left:4px}
+  .g{color:#6fe28a}.r{color:#ff6b6b}.y{color:#ffd24d}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:12px}
+  .card{background:#121a2e;border:1px solid #243049;border-radius:12px;padding:12px}
+  label{display:block;font-size:.75rem;color:#9aa7c2;margin-top:8px}
+  input[type=text],input[type=number],select{width:100%;padding:7px;border-radius:6px;border:1px solid #33425f;background:#0c1322;color:#e6ebf5}
+  input[type=range]{width:100%}
+  input[type=color]{width:52px;height:34px;border:0;background:none;padding:0}
+  button{padding:8px 11px;border:0;border-radius:7px;cursor:pointer;font-weight:600;font-size:.85rem}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .primary{background:#1e66d0;color:#fff}.warn{background:#c0392b;color:#fff}.ok{background:#2e8b4f;color:#fff}.dim{background:#2a3550;color:#dfe7f7}
+  .sw{width:calc(25% - 6px);min-width:64px;height:38px;border:2px solid #ffffff30;color:#000;text-shadow:0 0 3px #fff9;font-size:.75rem}
+  .chip{padding:5px 10px;border-radius:16px;border:2px solid #ffffff40;font-size:.75rem;cursor:pointer;user-select:none}
+  .chip.bloq{opacity:.55;text-decoration:line-through;border-color:#ff6b6b}
+  #log{height:180px;overflow:auto;background:#050810;border-radius:8px;padding:8px;font:12px/1.5 monospace}
+  #log .tx{color:#7cc4ff}#log .rx{color:#ffd27c}#log .err{color:#ff7b7b}#log .warn{color:#ffb84d}#log .ok{color:#6fe28a}
+  small{color:#8391ad}
+</style>
+</head>
+<body>
+<h1>Simulador de banda transportadora (ESP32 + TCS3200 + servomotor)</h1>
+
+<div class="hud">
+  <div class="pill">Banda:<b id="hBanda">-</b></div>
+  <div class="pill">Sensor:<b id="hSensor">-</b></div>
+  <div class="pill">Servo:<b id="hServo">-</b></div>
+  <div class="pill">Aceptadas:<b class="g" id="hAc">0</b></div>
+  <div class="pill">Expulsadas:<b class="r" id="hEx">0</b></div>
+  <div class="pill">En cola:<b id="hCola">0</b></div>
+  <div class="pill">MQTT:<b id="hMqtt" class="r">desconectado</b></div>
+</div>
+
+<canvas id="cv"></canvas>
+
+<div class="grid">
+  <div class="card">
+    <h2>Conexión MQTT (WebSockets)</h2>
+    <div class="row"><div style="flex:2"><label>IP del broker (localhost si este PC ejecuta Mosquitto)</label><input type="text" id="host" value="localhost"></div>
+    <div style="flex:1"><label>Puerto WS</label><input type="number" id="port" value="9001"></div></div>
+    <div class="row"><div style="flex:1"><label>Usuario MQTT</label><input type="text" id="mqttUser" autocomplete="username"></div>
+    <div style="flex:1"><label>Contraseña MQTT</label><input type="password" id="mqttPass" autocomplete="current-password"></div></div>
+    <label>Prefijo de topics</label><input type="text" id="prefix" value="banda">
+    <small>Publica en: <code>banda/sensor/color</code>, <code>banda/estado</code>, <code>banda/resultado</code><br>Escucha: <code>banda/comandos</code></small>
+    <small>Este simulador usa WebSockets en 9001. En el celular, la app usa TCP en 1883 y la IPv4 de este computador.</small>
+    <small>Para probar la app, usa el simulador como ESP32 virtual. No conectes el ESP32 real al mismo tiempo: ambos publicarían lecturas en banda/sensor/color.</small>
+    <label>¿Quién decide si una caja se expulsa?</label>
+    <select id="modo">
+      <option value="app">La app (responde por MQTT)</option>
+      <option value="local">Lista local de este simulador</option>
+    </select>
+    <div class="row" style="margin-top:10px"><button class="primary" id="btnConn">Conectar</button></div>
+  </div>
+
+  <div class="card">
+    <h2>Mandar cajas a la banda</h2>
+    <div class="row" id="presets"></div>
+    <div class="row" style="margin-top:10px">
+      <input type="color" id="custom" value="#ff5200"><button class="dim" id="btnCustom">Añadir caja de este color</button>
+    </div>
+    <label><input type="checkbox" id="auto"> Generar cajas automáticamente</label>
+    <input type="range" id="autoInt" min="1.5" max="8" step="0.5" value="3.5">
+    <small>Cada <span id="autoV">3.5</span> s</small>
+  </div>
+
+  <div class="card">
+    <h2>Simulación</h2>
+    <label>Velocidad de la banda</label><input type="range" id="vel" min="50" max="170" value="95">
+    <label>Probabilidad de lectura fallida: <span id="pfV">20</span>%</label><input type="range" id="pf" min="0" max="60" value="20">
+    <label>Ruido del sensor (±): <span id="ruV">5</span></label><input type="range" id="ru" min="0" max="20" value="5">
+    <div class="row" style="margin-top:10px">
+      <button class="warn" id="btnStop">Detener banda</button>
+      <button class="ok" id="btnStart">Iniciar banda</button>
+      <button class="dim" id="btnClear">Vaciar</button>
+    </div>
+    <small>Los botones de detener/iniciar sirven para probar sin la app.</small>
+  </div>
+
+  <div class="card">
+    <h2>Lista local (solo modo local)</h2>
+    <small>Toca un color para bloquearlo. Los bloqueados se expulsan.</small>
+    <div class="row" id="chips" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:12px"><h2>Registro</h2><div id="log"></div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const cv=$('cv'),ctx=cv.getContext('2d');
+const CW=1000,CH=440;
+(function(){const d=Math.min(window.devicePixelRatio||1,2);cv.width=CW*d;cv.height=CH*d;ctx.setTransform(d,0,0,d,0,0)})();
+
+/* ---------- geometría ---------- */
+const L=740,W=96,H=52,BW=44,BD=44,BH=40,OX=110,OY=300,SX=300,VX=520;
+const P=(x,y,z)=>[OX+x-0.55*y, OY+0.32*y-z];
+const clamp=v=>Math.max(0,Math.min(255,Math.round(v)));
+const shade=(c,f)=>`rgb(${clamp(c[0]*f)},${clamp(c[1]*f)},${clamp(c[2]*f)})`;
+function poly(pts,fill,stroke){ctx.beginPath();pts.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.closePath();if(fill){ctx.fillStyle=fill;ctx.fill()}if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=1;ctx.stroke()}}
+function cube(x,y,z,w,d,h,col){
+  const e='rgba(0,0,0,.35)';
+  poly([P(x,y+d,z),P(x+w,y+d,z),P(x+w,y+d,z+h),P(x,y+d,z+h)],shade(col,.85),e);
+  poly([P(x+w,y,z),P(x+w,y+d,z),P(x+w,y+d,z+h),P(x+w,y,z+h)],shade(col,.6),e);
+  poly([P(x,y,z+h),P(x+w,y,z+h),P(x+w,y+d,z+h),P(x,y+d,z+h)],shade(col,1.15),e);
+}
+function rr(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}
+
+/* ---------- estado ---------- */
+const presets=[
+  {n:'Rojo',c:[220,30,30]},{n:'Verde',c:[30,170,60]},{n:'Azul',c:[30,90,230]},{n:'Amarillo',c:[240,210,20]},
+  {n:'Naranja',c:[255,82,0]},{n:'Morado',c:[140,50,190]},{n:'Blanco',c:[240,240,240]},{n:'Café',c:[120,75,40]}];
+const bloqueados=new Set();
+const boxes=[],cola=[];
+let nextId=1;
+const st={running:true,ac:0,ex:0,tx:0,rx:0,belt:0,hb:0,lastKey:'',autoT:0,reading:null,readingT:0,
+          servo:{phase:'idle',e:0,t:0,box:null}};
+let client=null,connected=false;
+
+function log(t,cls){const l=$('log'),d=document.createElement('div');d.textContent=new Date().toLocaleTimeString()+'  '+t;if(cls)d.className=cls;l.appendChild(d);while(l.children.length>150)l.removeChild(l.firstChild);l.scrollTop=l.scrollHeight}
+const gauss=()=>Math.sqrt(-2*Math.log(1-Math.random()))*Math.cos(2*Math.PI*Math.random());
+const speed=()=>+$('vel').value, pFail=()=>+$('pf').value/100, sigma=()=>+$('ru').value;
+const modoApp=()=>$('modo').value==='app'&&connected;
+
+/* ---------- MQTT ---------- */
+const pref=()=>$('prefix').value.trim().replace(/\/+$/,'')||'banda';
+function pub(sub,obj){
+  if(!connected)return;
+  const t=pref()+'/'+sub,s=JSON.stringify(obj);
+  client.publish(t,s);st.tx=.3;log('→ ['+t+'] '+s,'tx');
+}
+$('btnConn').onclick=()=>{
+  if(typeof mqtt==='undefined'){log('No se cargó la librería MQTT (¿sin internet?). El modo local funciona igual.','err');return}
+  if(client){client.end(true);client=null;connected=false}
+  const url='ws://'+$('host').value.trim()+':'+$('port').value.trim();
+  log('Conectando a '+url+' ...');
+  client=mqtt.connect(url,{clientId:'sim-esp32-'+Math.random().toString(16).slice(2,8),
+    username:$('mqttUser').value.trim(),password:$('mqttPass').value,
+    reconnectPeriod:3000,connectTimeout:5000});
+  client.on('connect',()=>{connected=true;log('Conectado al broker','ok');client.subscribe(pref()+'/comandos');st.lastKey=''});
+  client.on('close',()=>{if(connected)log('Conexión perdida: la banda sigue funcionando sola','err');connected=false});
+  client.on('error',e=>log('Error MQTT: '+e.message,'err'));
+  client.on('message',(t,m)=>onMsg(t,m.toString()));
+};
+function onMsg(t,txt){
+  st.rx=.3;log('← ['+t+'] '+txt,'rx');
+  let id=null,word=txt,value=null;
+  try{const j=JSON.parse(txt);if(j&&typeof j==='object'){word=String(j.accion??j.comando??j.cmd??j.action??'');id=j.id??null;value=j.valor??j.velocidad??null}else word=String(j)}catch(e){}
+  const w=word.toLowerCase();
+  if(w==='velocidad'||w==='speed'){
+    const percent=Number(value);
+    if(!Number.isFinite(percent)){log('Comando de velocidad inválido','err');return}
+    const bounded=Math.max(10,Math.min(100,percent));
+    $('vel').value=50+(bounded-10)/90*120;
+    log('Velocidad ajustada a '+Math.round(bounded)+'%','ok');
+    return
+  }
+  if(/expuls|rechaz|bloque|reject|block|eject/.test(w))return decidir(id,'expulsar');
+  if(/acept|permit|accept|allow|pasar/.test(w))return decidir(id,'aceptar');
+  if(/deten|par[ae]r|stop|pausa/.test(w)){st.running=false;log('La app detuvo la banda','warn');return}
+  if(/inici|start|reanud|marcha|play/.test(w)){st.running=true;log('La app reanudó la banda','ok');return}
+  log('Comando no reconocido','warn');
+}
+function decidir(id,dec){
+  const b=id!=null?boxes.find(x=>x.id==id)
+    :boxes.filter(x=>x.scanned&&!x.decision&&!x.passed&&x.state==='ride'||x.state==='wait').filter(x=>x.scanned&&!x.decision).sort((a,b)=>a.id-b.id)[0];
+  if(!b){log('Decisión recibida sin caja pendiente (ignorada)','warn');return}
+  b.decision=dec;log('Decisión para caja #'+b.id+': '+dec,dec==='expulsar'?'warn':'ok');
+}
+
+/* ---------- lógica ---------- */
+function clasificar(m){
+  let best=null,bd=1e9;
+  for(const p of presets){const d=Math.hypot(m[0]-p.c[0],m[1]-p.c[1],m[2]-p.c[2]);if(d<bd){bd=d;best=p}}
+  if(best&&bd<110&&bloqueados.has(best.n))return 'expulsar';
+  return 'aceptar';
+}
+function encolar(name,c){if(cola.length<20)cola.push({name,c})}
+function spawn(o){boxes.push({id:nextId++,name:o.name,c:o.c,x:20,y:(W-BD)/2,z:H+90,vz:0,state:'spawn',decision:null,scanned:false,passed:false,t:0,attempt:0,alpha:1})}
+const beltMoves=()=>st.running&&st.servo.phase==='idle'&&!boxes.some(b=>b.state==='scan'||b.state==='wait');
+
+function atServo(b){
+  if(b.decision==='aceptar'){b.passed=true}
+  else if(b.decision==='expulsar'){b.state='push';b.x=VX-BW/2;st.servo.phase='extend';st.servo.box=b;st.servo.t=0}
+  else{b.state='wait';b.t=0;log('Caja #'+b.id+' espera la decisión de la app...','warn')}
+}
+function finishScan(b){
+  b.attempt++;
+  if(Math.random()<pFail()&&b.attempt<=3){
+    const bad=b.c.map(v=>clamp(v+(Math.random()*140-70)));
+    st.reading={rgb:bad,bad:true};st.readingT=1.3;b.t=0;
+    log('Caja #'+b.id+': lectura inválida (varianza alta), reintentando ('+b.attempt+')','warn');return;
+  }
+  const m=b.c.map(v=>clamp(v+gauss()*sigma()));
+  b.reading=m;b.scanned=true;b.state='ride';
+  st.reading={rgb:m,bad:false};st.readingT=2.2;
+  pub('sensor/color',{id:b.id,r:m[0],g:m[1],b:m[2],ts:Date.now()});
+  if(!modoApp()){
+    b.decision=clasificar(m);
+    log('Caja #'+b.id+' leída RGB('+m.join(',')+') → '+b.decision+' (lista local)',b.decision==='expulsar'?'warn':'ok');
+  }else log('Caja #'+b.id+' leída RGB('+m.join(',')+'), esperando a la app');
+}
+function update(dt){
+  const mv=beltMoves(),dx=mv?speed()*dt:0;
+  if(mv)st.belt=(st.belt+dx)%36;
+  if(st.tx>0)st.tx-=dt;if(st.rx>0)st.rx-=dt;if(st.readingT>0)st.readingT-=dt;
+  if($('auto').checked){st.autoT+=dt;if(st.autoT>=+$('autoInt').value){st.autoT=0;const p=presets[Math.floor(Math.random()*presets.length)];encolar(p.n,p.c)}}
+  if(cola.length&&!boxes.some(b=>b.state==='spawn'||(b.state==='ride'&&b.x<80)))spawn(cola.shift());
+
+  const now=performance.now()/1000;
+  for(const b of boxes){
+    switch(b.state){
+      case 'spawn':b.vz-=900*dt;b.z+=b.vz*dt;if(b.z<=H){b.z=H;b.vz=0;b.state='ride'}break;
+      case 'ride':{
+        b.x+=dx;const cx=b.x+BW/2;
+        if(!b.scanned&&cx>=SX){b.x=SX-BW/2;b.state='scan';b.t=0;b.attempt=0}
+        else if(b.scanned&&!b.passed&&cx>=VX){b.x=VX-BW/2;atServo(b)}
+        else if(b.passed&&cx>=L){b.state='end';b.vz=0}
+        break}
+      case 'scan':b.t+=dt;if(b.t>=1.1)finishScan(b);break;
+      case 'wait':b.t+=dt;
+        if(b.decision){b.state='ride';atServo(b)}
+        else if(b.t>4){b.decision='aceptar';log('Sin respuesta de la app: la caja #'+b.id+' se deja pasar (fail-safe)','warn')}
+        break;
+      case 'fall':b.vz-=900*dt;b.z+=b.vz*dt;
+        if(b.z<=4){b.z=4;b.state='binned';b.landed=now;st.ex++;
+          pub('resultado',{id:b.id,r:b.reading[0],g:b.reading[1],b:b.reading[2],resultado:'expulsada'});
+          log('Caja #'+b.id+' expulsada por el servo','warn')}
+        break;
+      case 'end':b.vz-=900*dt;b.z+=b.vz*dt;b.x+=120*dt;
+        if(b.z<=4){b.z=4;b.state='binned';b.landed=now;st.ac++;
+          pub('resultado',{id:b.id,r:b.reading[0],g:b.reading[1],b:b.reading[2],resultado:'aceptada'});
+          log('Caja #'+b.id+' aceptada','ok')}
+        break;
+      case 'binned':{const a=now-b.landed;b.alpha=a>2?Math.max(0,1-(a-2)):1}break;
+    }
+  }
+  for(let i=boxes.length-1;i>=0;i--)if(boxes[i].state==='binned'&&boxes[i].alpha<=0)boxes.splice(i,1);
+
+  const s=st.servo;
+  if(s.phase!=='idle'){
+    if(s.phase==='extend'){s.e=Math.min(1,s.e+dt/.6);if(s.e>=1){s.phase='hold';s.t=0}}
+    else if(s.phase==='hold'){s.t+=dt;if(s.t>.15)s.phase='retract'}
+    else if(s.phase==='retract'){s.e=Math.max(0,s.e-dt/.5);if(s.e<=0){s.phase='idle';s.box=null}}
+    const b=s.box;
+    if(b&&s.phase!=='retract'){
+      const p=-2+s.e*112;b.y=Math.max(b.y,p);
+      if(b.state==='push'&&b.y>=W+6){b.state='fall';b.vz=0}
+    }
+  }
+  /* estado hacia la app */
+  st.hb+=dt;
+  const obj={banda:st.running?(mv?'en_marcha':'pausa'):'detenida',sensor:boxes.some(b=>b.state==='scan')?'midiendo':'libre',
+             servo:s.phase==='idle'?'reposo':'empujando',aceptadas:st.ac,expulsadas:st.ex,
+             velocidad:Math.round(10+(speed()-50)/120*90),unidadVelocidad:'%'};
+  const key=JSON.stringify(obj);
+  if(connected&&(key!==st.lastKey||st.hb>3)){st.lastKey=key;st.hb=0;pub('estado',obj)}
+}
+
+/* ---------- dibujo ---------- */
+const metal=[110,120,140];
+const ledColor=()=>{const sb=boxes.find(b=>b.state==='scan');if(!sb)return null;const t=sb.t;return t<.3?[255,50,50]:t<.6?[50,255,90]:t<.9?[70,120,255]:[255,255,255]};
+
+function drawBelt(){
+  poly([P(0,W,H-16),P(L,W,H-16),P(L,W,H),P(0,W,H)],'#262d3f','rgba(0,0,0,.4)');
+  poly([P(L,0,H-16),P(L,W,H-16),P(L,W,H),P(L,0,H)],'#1b2130','rgba(0,0,0,.4)');
+  poly([P(0,0,H),P(L,0,H),P(L,W,H),P(0,W,H)],'#3b4459','rgba(0,0,0,.4)');
+  ctx.strokeStyle='rgba(255,255,255,.08)';ctx.lineWidth=3;
+  for(let x=st.belt;x<L;x+=36){const a=P(x,0,H),b=P(x,W,H);ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke()}
+  cube(0,-8,H-16,L,8,22,[88,98,120]);
+  cube(0,W,H-16,L,8,22,[88,98,120]);
+}
+function drawBox(b){
+  ctx.globalAlpha=b.alpha;
+  cube(b.x,b.y,b.z,BW,BD,BH,b.c);
+  poly([P(b.x+BW/2-4,b.y,b.z+BH),P(b.x+BW/2+4,b.y,b.z+BH),P(b.x+BW/2+4,b.y+BD,b.z+BH),P(b.x+BW/2-4,b.y+BD,b.z+BH)],'rgba(255,255,255,.25)');
+  ctx.fillStyle='rgba(0,0,0,.55)';ctx.font='bold 11px system-ui';ctx.textAlign='center';
+  const q=P(b.x+BW/2,b.y+BD,b.z+BH/2);ctx.fillText('#'+b.id,q[0],q[1]+4);
+  ctx.globalAlpha=1;
+}
+function drawServo(){
+  const s=st.servo,p=-2+s.e*112;
+  cube(VX-14,-48,0,28,28,H+4,[70,78,96]);
+  cube(VX-16,-50,H+4,32,34,26,[30,90,200]);
+  const hc=P(VX,-33,H+30),a=-.5+s.e*1.7,he=P(VX+16*Math.cos(a),-33+16*Math.sin(a),H+30);
+  ctx.strokeStyle='#f1f4fb';ctx.lineWidth=4;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(hc[0],hc[1]);ctx.lineTo(he[0],he[1]);ctx.stroke();
+  ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(hc[0],hc[1],4,0,7);ctx.fill();
+  if(p-6>-16)cube(VX-5,-16,H+14,10,(p-6)+16,8,[190,195,210]);
+  cube(VX-20,p-6,H+4,40,6,32,[220,70,70]);
+}
+function drawSensorFront(){
+  cube(SX-6,W+4,0,12,12,H+120,metal);
+  cube(SX-10,-16,H+104,20,W+32,16,[80,90,112]);
+  cube(SX-24,W/2-18,H+66,48,36,38,[40,48,68]);
+  const led=ledColor(),lc=P(SX,W/2+18,H+85);
+  if(led){
+    const t=P(SX-8,W/2,H+66),t2=P(SX+8,W/2,H+66),b2=P(SX+20,W/2,H+BH+2),b1=P(SX-20,W/2,H+BH+2);
+    poly([t,t2,b2,b1],`rgba(${led[0]},${led[1]},${led[2]},.35)`);
+    const g=P(SX,W/2,H+BH);ctx.fillStyle=`rgba(${led[0]},${led[1]},${led[2]},.55)`;
+    ctx.beginPath();ctx.ellipse(g[0],g[1],24,9,0,0,7);ctx.fill();
+  }
+  ctx.fillStyle=led?`rgb(${led})`:'#4a6a8a';ctx.beginPath();ctx.arc(lc[0],lc[1],7,0,7);ctx.fill();
+  ctx.strokeStyle='#0008';ctx.lineWidth=2;ctx.stroke();
+}
+function label(txt,pt,dx,dy){ctx.fillStyle='rgba(255,255,255,.6)';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText(txt,pt[0]+(dx||0),pt[1]+(dy||0))}
+function drawBalloon(){
+  const sb=boxes.find(b=>b.state==='scan'),a=P(SX,W/2,H+150);
+  let txt=null,col='#e6ebf5',rgb=null;
+  if(sb&&st.readingT<=0){const t=sb.t;txt='Midiendo '+(t<.3?'R':t<.6?'G':t<.9?'B':'...');}
+  else if(st.readingT>0&&st.reading){
+    if(st.reading.bad){txt='⚠ Lectura inválida';col='#ff7b7b'}
+    else{rgb=st.reading.rgb;txt='RGB '+rgb.join(', ')}
+  }
+  if(!txt)return;
+  ctx.font='bold 13px system-ui';const w=ctx.measureText(txt).width+(rgb?44:28);
+  rr(a[0]-w/2,a[1]-18,w,30,8);ctx.fillStyle='rgba(8,12,24,.92)';ctx.fill();ctx.strokeStyle='#3b4c70';ctx.lineWidth=1;ctx.stroke();
+  let tx=a[0];
+  if(rgb){ctx.fillStyle=`rgb(${rgb})`;ctx.beginPath();ctx.arc(a[0]-w/2+16,a[1]-3,8,0,7);ctx.fill();tx+=12}
+  ctx.fillStyle=col;ctx.textAlign='center';ctx.fillText(txt,tx,a[1]+2);
+}
+function drawESP(){
+  const x=24,y=352,w=140,h=70;
+  rr(x,y,w,h,8);ctx.fillStyle='#0f3b2c';ctx.fill();ctx.strokeStyle='#2c7a5a';ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle='#d6dde8';rr(x+10,y+12,50,30,3);ctx.fill();
+  ctx.fillStyle='#0f3b2c';ctx.font='bold 11px system-ui';ctx.textAlign='center';ctx.fillText('ESP32',x+35,y+31);
+  ctx.fillStyle=st.tx>0?'#ffa733':'#4a3a22';ctx.beginPath();ctx.arc(x+15,y+58,5,0,7);ctx.fill();
+  ctx.fillStyle=st.rx>0?'#5dff8a':'#1f4a33';ctx.beginPath();ctx.arc(x+35,y+58,5,0,7);ctx.fill();
+  ctx.fillStyle='#9fd6bd';ctx.font='9px system-ui';ctx.fillText('TX',x+15,y+48);ctx.fillText('RX',x+35,y+48);
+  const flash=st.tx>0||st.rx>0;
+  ctx.strokeStyle=flash?'#ffffff':(connected?'#6fe28a':'#556');ctx.lineWidth=3;ctx.lineCap='round';
+  for(let i=1;i<=3;i++){ctx.beginPath();ctx.arc(x+100,y+48,7*i,-Math.PI*.8,-Math.PI*.2);ctx.stroke()}
+  ctx.fillStyle=flash?'#fff':(connected?'#6fe28a':'#556');ctx.beginPath();ctx.arc(x+100,y+48,2.5,0,7);ctx.fill();
+  const f=P(SX,W+10,0);ctx.setLineDash([6,6]);ctx.lineDashOffset=-performance.now()/60;
+  ctx.strokeStyle='rgba(120,200,255,.5)';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x+w,y+30);ctx.lineTo(f[0],f[1]);ctx.stroke();ctx.setLineDash([]);
+}
+function draw(){
+  const g=ctx.createLinearGradient(0,0,0,CH);g.addColorStop(0,'#0c1322');g.addColorStop(1,'#1b2742');
+  ctx.fillStyle=g;ctx.fillRect(0,0,CW,CH);
+  poly([P(-40,-70,0),P(L+120,-70,0),P(L+120,W+110,0),P(-40,W+110,0)],'rgba(255,255,255,.035)');
+  poly([P(-6,-6,0),P(L+6,-6,0),P(L+6,W+6,0),P(-6,W+6,0)],'rgba(0,0,0,.4)');
+  [60,L-70].forEach(x=>cube(x,6,0,12,12,H-16,[70,78,92]));
+  drawBelt();
+  /* parte trasera */
+  cube(SX-6,-16,0,12,12,H+120,metal);
+  drawServo();
+  cube(VX-34,W+8,0,68,4,40,[110,45,55]);cube(VX-34,W+8,0,4,76,40,[110,45,55]);
+  cube(L+4,8,0,76,4,34,[40,100,75]);
+  /* cajas */
+  boxes.sort((a,b)=>a.y-b.y||b.x-a.x).forEach(drawBox);
+  /* parte delantera */
+  [60,L-70].forEach(x=>cube(x,W-18,0,12,12,H-16,[80,88,104]));
+  drawSensorFront();
+  cube(VX+30,W+8,0,4,76,40,[110,45,55]);cube(VX-34,W+84,0,68,4,40,[130,55,65]);
+  cube(L+76,8,0,4,80,34,[40,100,75]);
+  label('Sensor TCS3200',P(SX,W+40,0),10,20);
+  label('Servomotor',P(VX,-34,H+46),0,-4);
+  label('Rechazadas',P(VX,W+88,0),0,18);
+  label('Aceptadas',P(L+40,W,0),12,20);
+  drawBalloon();drawESP();
+}
+
+/* ---------- interfaz ---------- */
+presets.forEach(p=>{
+  const b=document.createElement('button');b.className='sw';b.textContent=p.n;b.style.background=`rgb(${p.c})`;
+  b.onclick=()=>encolar(p.n,p.c);$('presets').appendChild(b);
+  const c=document.createElement('div');c.className='chip';c.textContent=p.n;c.style.background=`rgb(${p.c})`;
+  c.style.color=(p.c[0]+p.c[1]+p.c[2]>400)?'#000':'#fff';
+  c.onclick=()=>{bloqueados.has(p.n)?bloqueados.delete(p.n):bloqueados.add(p.n);c.classList.toggle('bloq',bloqueados.has(p.n))};
+  $('chips').appendChild(c);
+});
+$('btnCustom').onclick=()=>{const h=$('custom').value;encolar('Personalizado',[parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)])};
+$('btnStop').onclick=()=>{st.running=false;log('Banda detenida (prueba local)','warn')};
+$('btnStart').onclick=()=>{st.running=true;log('Banda iniciada (prueba local)','ok')};
+$('btnClear').onclick=()=>{boxes.length=0;cola.length=0;st.servo={phase:'idle',e:0,t:0,box:null}};
+$('autoInt').oninput=()=>$('autoV').textContent=$('autoInt').value;
+$('pf').oninput=()=>$('pfV').textContent=$('pf').value;
+$('ru').oninput=()=>$('ruV').textContent=$('ru').value;
+
+let hudT=0;
+function hud(){
+  const mv=beltMoves();
+  const b=$('hBanda');b.textContent=!st.running?'DETENIDA':(mv?'EN MARCHA':'PAUSA');b.className=!st.running?'r':(mv?'g':'y');
+  $('hSensor').textContent=boxes.some(x=>x.state==='scan')?'midiendo':'libre';
+  $('hServo').textContent=st.servo.phase==='idle'?'reposo':'empujando';
+  $('hAc').textContent=st.ac;$('hEx').textContent=st.ex;$('hCola').textContent=cola.length;
+  const m=$('hMqtt');m.textContent=connected?'conectado':'desconectado';m.className=connected?'g':'r';
+}
+let last=performance.now();
+function loop(t){
+  const dt=Math.min(.05,(t-last)/1000);last=t;
+  update(dt);draw();
+  hudT+=dt;if(hudT>.1){hudT=0;hud()}
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+log('Simulador listo. Manda una caja o conecta al broker MQTT.');
+</script>
+</body>
+</html>

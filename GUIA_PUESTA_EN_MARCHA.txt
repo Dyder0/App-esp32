@@ -1,0 +1,359 @@
+GUIA DE PUESTA EN MARCHA
+App Android de banda transportadora, Firebase y MQTT
+====================================================
+
+Esta guia esta escrita para preparar una primera prueba en una sala de clases.
+La app usa dos conexiones distintas:
+
+1. Firebase (internet): cuentas, roles, inventario compartido y registro de paradas.
+2. MQTT TCP (red local): mensajes entre el telefono, Mosquitto y el ESP32.
+
+El proyecto incluye el plugin Google Services, pero no sube archivos de
+configuracion de Firebase. Debes obtener tu propio google-services.json,
+habilitar Authentication y Firestore, y publicar las reglas descritas abajo.
+No pegues contrasenas, claves privadas ni archivos de servicio de Firebase en
+Kotlin o en GitHub.
+
+
+PARTE A. PREPARAR FIREBASE
+--------------------------
+
+Firebase Authentication con correo y contrasena y Cloud Firestore pueden usarse
+en el plan Spark sin costo para una demostracion pequeña, dentro de sus cuotas
+gratuitas. En la consola de Firebase revisa siempre el plan y las cuotas vigentes.
+No agregues un metodo de pago para esta prueba si no lo necesitas.
+
+1. Abre https://console.firebase.google.com/ con una cuenta Google.
+2. Pulsa "Crear un proyecto". Ponle un nombre, por ejemplo BandaClase.
+3. Google Analytics es opcional; puedes dejarlo desactivado.
+4. En la pagina del proyecto, agrega una aplicacion Android.
+5. Escribe exactamente este nombre de paquete:
+
+       com.example.iot
+
+   Si Android Studio muestra otro applicationId en app/build.gradle.kts, usa
+   ese valor exacto.
+6. Descarga el archivo google-services.json de esa aplicacion y guardalo
+   localmente en:
+
+       app/google-services.json
+
+   El archivo esta excluido de Git. No lo publiques en el repositorio.
+7. En Firebase Console, abre Authentication > Comenzar > Sign-in method.
+   Activa "Correo electronico/Contrasena" y guarda.
+8. Abre Firestore Database > Crear base de datos. Para la prueba, crea la base
+   en una ubicacion cercana a tu pais. El modo de produccion es adecuado porque
+   mas abajo instalaremos reglas de acceso.
+9. Google Services ya esta aplicado en los build.gradle.kts del proyecto y las
+   bibliotecas Firebase Auth y Firestore ya estan agregadas. Abre Android
+   Studio y pulsa "Sync Now" si lo solicita.
+10. Ejecuta la app. Si dice que falta Firebase, verifica que el archivo
+    app/google-services.json este presente y que Gradle termino Sync.
+
+
+PARTE B. REGLAS DE FIRESTORE
+----------------------------
+
+En Firebase Console abre Firestore Database > Reglas. Reemplaza el contenido
+por estas reglas y pulsa Publicar:
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid))
+             .data.role == "admin";
+    }
+
+    function validCounterUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let acceptedDelta = request.resource.data.accepted - resource.data.accepted;
+      let rejectedDelta = request.resource.data.rejected - resource.data.rejected;
+      return signedIn()
+             && changed.hasOnly(["accepted", "rejected"])
+             && acceptedDelta >= 0
+             && rejectedDelta >= 0
+             && acceptedDelta <= 1
+             && rejectedDelta <= 1
+             && acceptedDelta + rejectedDelta == 1;
+    }
+
+    match /users/{uid} {
+      allow create: if signedIn()
+                    && request.auth.uid == uid
+                    && request.resource.data.role == "usuario";
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow update: if isAdmin()
+                    && request.resource.data.role in ["admin", "usuario"];
+      allow delete: if false;
+    }
+
+    match /inventoryColors/{colorId} {
+      allow read: if signedIn();
+      allow create: if isAdmin();
+      allow update: if isAdmin() || validCounterUpdate();
+      allow delete: if isAdmin();
+    }
+
+    match /results/{resultId} {
+      allow create: if signedIn()
+                    && request.resource.data.uid == request.auth.uid;
+      allow read: if signedIn();
+      allow update, delete: if false;
+    }
+
+    match /stoppages/{stopId} {
+      allow create: if signedIn()
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.reason is string
+                    && request.resource.data.reason.size() > 0;
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}
+
+NOTA: En la regla de inventoryColors, una cuenta normal solo puede aumentar
+exactamente uno de los contadores por resultado y no puede cambiar el permiso
+ni el RGB. Nunca uses "allow read, write: if true".
+
+
+PARTE C. CREAR ADMINISTRADOR Y CUENTAS DE USUARIO
+-------------------------------------------------
+
+No existe una cuenta administrador secreta dentro del codigo. Asi evitamos
+poner una contrasena comun que cualquiera pueda encontrar.
+
+Crear el primer administrador:
+
+1. En la app, escribe el correo y una contrasena de al menos 6 caracteres.
+2. Pulsa "Crear cuenta de usuario". Al principio todas las cuentas nuevas son
+   usuarios normales.
+3. En Firebase Console abre Authentication > Users y copia el UID de tu cuenta.
+4. Abre Firestore Database > Datos. Crea la coleccion users si aun no existe.
+5. Crea un documento cuyo ID sea exactamente el UID copiado.
+6. Agrega estos campos:
+
+       email   (string) = tu correo
+       role    (string) = admin
+
+   La app ya puede haber creado ese documento con role = usuario; en ese caso,
+   editalo y cambia solo el valor de role a admin.
+7. Cierra sesion y vuelve a entrar en la app. Debes ver el texto ADMINISTRADOR.
+
+Despues de esto el administrador puede cambiar el rol de otras cuentas desde
+"Cuentas y roles". La otra persona cierra sesion y vuelve a entrar para que se
+aplique el cambio. El administrador inicial no puede quitarse su propio rol
+desde la pantalla de la app.
+
+Crear trabajadores:
+
+1. La persona abre la app y pulsa "Crear cuenta de usuario".
+2. El administrador entra en su app y confirma que esa cuenta aparezca en
+   "Cuentas y roles".
+3. Si corresponde, pulsa "Hacer admin"; normalmente se deja como usuario.
+
+ADMIN puede administrar colores, dar de alta colores y cambiar los roles.
+USUARIO puede consultar el inventario y operar la banda. Al detener, el usuario
+debe escribir un motivo; el administrador no necesita ingresarlo y la app
+registra la parada automáticamente con su cuenta y la hora en Firestore.
+
+
+PARTE D. INSTALAR Y CONECTAR MOSQUITTO EN LA SALA
+-------------------------------------------------
+
+Para una prueba facil, Mosquitto puede ejecutarse en un computador conectado
+al mismo router Wi-Fi que el telefono y el ESP32.
+
+1. Instala Mosquitto para Windows desde https://mosquitto.org/download/.
+2. El simulador incluido en el repositorio es
+   simulador_banda_3d.html. Abrelo en un navegador con Internet (carga MQTT.js
+   desde jsDelivr).
+3. Crea un archivo local para las contrasenas MQTT, fuera del repositorio:
+
+       mosquitto_passwd -c C:\ruta\privada\passwd nombre_usuario
+
+   Mosquitto solicita la contrasena y guarda un hash. No compartas ni subas
+   ese archivo.
+4. Configura Mosquitto para escuchar en TCP 1883 y WebSockets 9001, con
+   autenticacion y la ruta local al archivo passwd. Ejemplo de configuracion:
+
+       listener 1883
+       protocol mqtt
+       listener 9001
+       protocol websockets
+       allow_anonymous false
+       password_file C:\ruta\privada\passwd
+
+   Inicia el broker con `mosquitto -c C:\ruta\mosquitto-clase.conf -v`.
+   En el HTML pulsa Conectar e ingresa las credenciales MQTT creadas arriba.
+5. En el computador del broker, abre PowerShell y ejecuta:
+
+       ipconfig
+
+   Busca "Direccion IPv4" del adaptador Wi-Fi conectado al router. Ejemplo:
+   192.168.1.25. No uses 127.0.0.1: esa direccion solo apunta al mismo equipo.
+6. Deja abierta la ventana del broker. No inicies una segunda instancia de
+   Mosquitto si ya esta ejecutandose.
+7. Si Windows Firewall pregunta, permite los puertos TCP 1883 y 9001 solo en
+   el perfil Privado. No abras el perfil Publico.
+8. Comprueba desde otro computador de la misma red:
+
+       Test-NetConnection 192.168.1.25 -Port 1883
+
+   Cambia 192.168.1.25 por la IPv4 que viste en ipconfig. Busca
+   "TcpTestSucceeded : True". Si dice False, revisa Mosquitto, firewall y que
+   los equipos esten en la misma red.
+9. En la app, entra con Firebase, escribe la IPv4 y puerto 1883, e ingresa el
+   mismo usuario y contrasena MQTT. La app guarda el usuario, pero no guarda la
+   contrasena. El indicador debe decir Conectado.
+10. El ESP32 tambien debe conectarse con ese usuario y contrasena al broker y
+    publicar/suscribirse en los topics acordados. El telefono no conecta
+    directamente al ESP32.
+11. Si la escuela tiene una red de invitados, puede aislar a los equipos entre
+   si. Pide una red de laboratorio que permita comunicacion entre clientes.
+   Para la clase, prueba tambien con un punto de acceso Wi-Fi propio.
+
+Topics usados:
+
+  ESP32 publica  banda/sensor/color
+  ESP32 publica  banda/estado
+  ESP32 publica  banda/resultado
+  App publica    banda/comandos
+
+La app se conecta a Mosquitto por TCP al puerto 1883. Firebase usa internet y
+es independiente del broker; no reemplaza MQTT.
+
+El HTML es un ESP32 virtual para probar la app desde el celular. El HTML se
+conecta a localhost:9001 porque corre en el mismo computador que Mosquitto; el
+celular usa la IPv4 de ese computador y puerto 1883. Ambos piden usuario y
+contrasena MQTT. El transporte MQTT de esta configuracion no usa TLS: la
+contrasena viaja por la red local sin cifrado. No uses una red publica, no
+reenvies los puertos a internet y no uses una contrasena importante de otras
+cuentas. No conectes el ESP32 real y el simulador a la vez: ambos publican en
+banda/sensor/color y podrian duplicar o mezclar lecturas.
+
+
+PARTE E. USO NORMAL Y ALTA DE COLOR
+-----------------------------------
+
+Operar:
+
+1. Entra con una cuenta de Firebase.
+2. Conecta el telefono al Wi-Fi de laboratorio.
+3. Conecta la app al broker usando la IPv4 del computador que ejecuta Mosquitto
+   y el puerto 1883.
+4. La pantalla principal muestra la animacion sencilla de la banda, el estado
+   y la velocidad reportada. Inicia sesion con Firebase y pulsa "Configurar"
+   en la tarjeta MQTT para abrir broker, velocidad y cuentas. "Inventario" abre
+   los colores y las ultimas cajas.
+5. Una lectura RGB se compara con el inventario usando distancia euclidiana
+   con tolerancia 90. Si se parece a un color bloqueado se expulsa; si se
+   parece a uno permitido se acepta. En Configuracion, "Solo aceptar colores
+   del inventario" esta activado inicialmente: un color sin coincidencia se
+   expulsa. Si se desactiva, ese color se acepta, pero no se agrega al inventario
+   automaticamente; para registrarlo usa el flujo de muestra de administrador.
+   Este ajuste se guarda en cada telefono, asi que configuralo igual en cada
+   dispositivo desde el que se vaya a operar la banda.
+
+Para mostrar la velocidad, el JSON de banda/estado puede incluir "velocidad"
+y, opcionalmente, "unidadVelocidad", por ejemplo:
+  {"banda":"en marcha","sensor":"listo","servo":"reposo",
+   "aceptadas":0,"expulsadas":0,"velocidad":80,"unidadVelocidad":"%"}
+Sin ese dato la app muestra "Sin datos". La animacion es solo visual y no mide
+la velocidad real del motor.
+
+Para ajustar la velocidad desde la app, abre la tarjeta MQTT, mueve el control
+"Velocidad de la banda" entre 10% y 100% y pulsa "Aplicar velocidad". Publica:
+  {"accion":"velocidad","valor":60}
+El simulador entiende ese comando. El firmware del ESP32 fisico tambien debe
+suscribirse a banda/comandos y programar la velocidad del motor usando ese
+porcentaje; si no reconoce la accion, no cambiara la velocidad del hardware.
+
+Detener por operacion o emergencia:
+
+1. Pulsa "Detener banda".
+2. El usuario escribe un motivo obligatorio; si es administrador, la parada
+   se registra automaticamente sin pedirlo.
+3. La app publica {"accion":"detener"} y registra en Firestore quien y por que
+   hizo la parada.
+4. Pulsa "Iniciar banda" para reanudar.
+
+Dar de alta una muestra (solo administrador):
+
+1. Abre "Inventario" y pulsa "Detener y capturar muestra". La banda recibe una orden de detenerse
+   y la app registra el motivo "Preparacion para dar de alta un color".
+2. Prepara una caja que represente el color. Cuando sea seguro pasarla por el
+   sensor, pulsa "Pasar caja de muestra".
+3. La app reanuda la banda para que la muestra llegue al sensor.
+4. Al recibir la lectura, la app acepta esa caja, ordena detener la banda y
+   muestra los valores RGB medidos.
+5. Escribe un nombre y marca si ese color queda permitido o bloqueado.
+6. Pulsa "Guardar color". El color y su RGB quedan en Firestore para todos.
+   La app mantiene la banda detenida; pulsa "Iniciar banda" cuando el area
+   este segura.
+
+La detencion de captura es automatica y queda registrada como "Parada
+automatica para capturar una muestra de color". Comprueba que tu ESP32 atienda
+los comandos de la app y publique la lectura. Si el dispositivo no detiene la
+banda al recibir el comando, no uses el flujo automatico hasta revisar el
+programa del ESP32 y probarlo sin cajas.
+
+
+PARTE F. COMO ENTENDER EL CODIGO KOTLIN
+---------------------------------------
+
+Kotlin es el lenguaje. Jetpack Compose es la herramienta que dibuja la pantalla
+con funciones Kotlin.
+
+MainActivity.kt
+  Es la entrada de la app. ConveyorApp guarda el estado visible, muestra login
+  o pantalla de operacion y conecta las acciones de la pantalla con Firebase y
+  MQTT.   ConveyorScreen contiene las pantallas principal, inventario y configuracion.
+  Las funciones receiveColor, receiveStatus y receiveResult interpretan
+  mensajes JSON de MQTT.
+
+  mutableStateOf guarda un valor que Compose debe volver a mostrar cuando
+  cambia. Por ejemplo, connection cambia de "Desconectado" a "Conectado".
+  mutableStateListOf es una lista que Compose vuelve a dibujar cuando cambia el
+  inventario.
+
+  ConveyorBeltAnimation usa Canvas para dibujar una banda sencilla y una caja
+  que se desplaza cuando el estado indica que la banda esta en marcha.
+
+  decisionFor calcula cual color del inventario esta mas cerca del RGB medido.
+  La distancia se calcula con las diferencias de rojo, verde y azul. Si no hay
+  coincidencia dentro de 90 unidades, la decision depende de la opcion "Solo
+  aceptar colores del inventario".
+
+FirebaseRepository.kt
+  Mantiene juntas las llamadas a Firebase: crear cuenta, iniciar sesion,
+  consultar rol, escuchar colores e historial, actualizar contadores y
+  registrar paradas. La pantalla no necesita construir consultas Firestore
+  por su cuenta.
+
+ColorRulesTest.kt
+  Prueba colores cercanos permitidos y bloqueados, la regla de colores nuevos
+  y el limite de distancia.
+
+build.gradle.kts
+  Indica las bibliotecas que Gradle descarga. Firebase Authentication valida
+  correos y contrasenas; Firestore guarda datos compartidos; Paho implementa
+  MQTT.
+
+mosquitto-clase.conf
+  Abre los listeners TCP y WebSockets y exige un archivo de contrasenas.
+  Crear_Usuario_MQTT.bat ejecuta mosquitto_passwd para crear esa cuenta sin
+  guardar la contrasena en el codigo fuente.
+
+AndroidManifest.xml
+  Declara el permiso de internet que necesitan Firebase y MQTT.
+
+Para localizar una funcion en Android Studio, usa Ctrl+F y escribe su nombre.
+Para eliminar este tutorial, basta con borrar este archivo TXT; la app no lo
+necesita para compilar ni ejecutarse.
