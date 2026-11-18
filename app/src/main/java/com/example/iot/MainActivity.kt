@@ -1,11 +1,21 @@
 package com.example.iot
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +24,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -36,6 +47,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -46,6 +58,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
@@ -54,15 +67,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import org.eclipse.paho.client.mqttv3.IMqttActionListener
-import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
-import org.eclipse.paho.client.mqttv3.IMqttToken
-import org.eclipse.paho.client.mqttv3.MqttAsyncClient
-import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
-import org.eclipse.paho.client.mqttv3.MqttConnectOptions
-import org.eclipse.paho.client.mqttv3.MqttException
-import org.eclipse.paho.client.mqttv3.MqttMessage
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import kotlinx.coroutines.delay
 import org.json.JSONException
 import org.json.JSONObject
 import java.text.DateFormat
@@ -72,10 +77,11 @@ import java.util.UUID
 private const val COLOR_TOPIC = "banda/sensor/color"
 private const val STATUS_TOPIC = "banda/estado"
 private const val RESULT_TOPIC = "banda/resultado"
-private const val COMMAND_TOPIC = "banda/comandos"
 private const val ROLE_ADMIN = "admin"
-private const val ROLE_USER = "usuario"
+private const val ROLE_OPERATOR = "operador"
+private const val ROLE_MAINTENANCE = "mantenimiento"
 private const val RGB_TOLERANCE = 90.0
+private const val HANDLED_RESULT_IDS_KEY = "handled_mqtt_result_ids"
 
 data class Rgb(val red: Int, val green: Int, val blue: Int)
 
@@ -94,13 +100,16 @@ data class ConveyorStatus(
     val servo: String = "Sin datos",
     val accepted: Int = 0,
     val rejected: Int = 0,
-    val speed: String = "Sin datos"
+    val speed: String = "Sin datos",
+    val receivedAt: Long? = null
 )
+
+private data class BatteryStatus(val percentage: Int = 0, val charging: Boolean = false)
 
 private data class SensorReading(val id: Long, val rgb: Rgb)
 
 private enum class LearningStep { OFF, READY, WAITING_FOR_SAMPLE, NAMING_COLOR }
-private enum class AppPage { HOME, INVENTORY, SETTINGS }
+private enum class AppPage { HOME, INVENTORY, SETTINGS, ENERGY, HISTORY }
 
 private val defaultColors = listOf(
     InventoryColor("Rojo", Rgb(220, 30, 30), id = "rojo"),
@@ -117,22 +126,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val preferences = getSharedPreferences("mqtt_settings", MODE_PRIVATE)
+        val brokerConfigStore = SecureBrokerConfigStore(applicationContext)
         val firebase = FirebaseRepository(applicationContext)
         setContent {
             ConveyorApp(
                 firebase = firebase,
-                initialHost = preferences.getString("broker_host", "192.168.1.100") ?: "192.168.1.100",
-                initialPort = preferences.getString("broker_port", "1883") ?: "1883",
-                initialMqttUser = preferences.getString("mqtt_user", "") ?: "",
+                devicePreferences = preferences,
+                initialBrokerConfig = brokerConfigStore.load(),
                 initialBeltSpeed = preferences.getInt("belt_speed", 60),
                 initialAllowUnknownColors = preferences.getBoolean("allow_unknown_colors", false),
-                saveBroker = { host, port, username ->
-                    preferences.edit()
-                        .putString("broker_host", host)
-                        .putString("broker_port", port)
-                        .putString("mqtt_user", username)
-                        .apply()
-                },
+                saveBrokerConfig = brokerConfigStore::save,
                 saveAllowUnknownColors = { allow ->
                     preferences.edit().putBoolean("allow_unknown_colors", allow).apply()
                 },
@@ -147,50 +150,175 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ConveyorApp(
     firebase: FirebaseRepository,
-    initialHost: String,
-    initialPort: String,
-    initialMqttUser: String,
+    devicePreferences: SharedPreferences,
+    initialBrokerConfig: BrokerConfig,
     initialBeltSpeed: Int,
     initialAllowUnknownColors: Boolean,
-    saveBroker: (String, String, String) -> Unit,
+    saveBrokerConfig: (BrokerConfig) -> Unit,
     saveAllowUnknownColors: (Boolean) -> Unit,
     saveBeltSpeed: (Int) -> Unit
 ) {
-    val colors = remember { mutableStateListOf<InventoryColor>().apply { addAll(defaultColors) } }
-    val connection = remember { mutableStateOf("Desconectado") }
+    val context = LocalContext.current.applicationContext
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val localData = remember { LocalDataRepository(context) }
+    val powerManager = remember { context.getSystemService(PowerManager::class.java) }
+    val colors = remember { mutableStateListOf<InventoryColor>() }
+    val connection = remember { mutableStateOf("Sin conexión") }
     val status = remember { mutableStateOf(ConveyorStatus()) }
-    val eventMessage = remember { mutableStateOf("Ingresa con tu cuenta para comenzar.") }
+    val eventMessage = remember { mutableStateOf("Ingresa para continuar.") }
+    val loginAttemptLimiter = remember { LoginAttemptLimiter() }
+    val pendingSyncCount = remember { mutableStateOf(0) }
     val session = remember { mutableStateOf<AppUser?>(null) }
     val inventoryLoaded = remember { mutableStateOf(false) }
     val boxHistory = remember { mutableStateOf<List<BoxHistoryEntry>>(emptyList()) }
+    val connectionHistory = remember { mutableStateOf<List<ConnectionHistoryItem>>(emptyList()) }
+    val mqttStats = remember { mutableStateOf(MqttTrafficStats(0, 0, 0)) }
+    val decisionDelivery = remember { mutableStateOf<DecisionDeliveryState?>(null) }
+    val batteryStatus = remember { mutableStateOf(BatteryStatus()) }
+    val systemPowerSave = remember { mutableStateOf(powerManager.isPowerSaveMode) }
+    val energySavingEnabled = remember {
+        mutableStateOf(devicePreferences.getBoolean("energy_saving_enabled", false))
+    }
+    val lastDataReceivedAt = remember { mutableStateOf<Long?>(null) }
     val allowUnknownColors = remember { mutableStateOf(initialAllowUnknownColors) }
     val beltSpeed = remember { mutableStateOf(initialBeltSpeed.coerceIn(10, 100)) }
-    val handledResults = remember { mutableSetOf<Long>() }
+    val handledResults = remember {
+        devicePreferences.getStringSet(HANDLED_RESULT_IDS_KEY, emptySet())
+            .orEmpty()
+            .mapNotNull(String::toLongOrNull)
+            .toMutableSet()
+    }
+    val processingResults = remember { mutableSetOf<Long>() }
     val learning = remember { mutableStateOf(LearningStep.OFF) }
     val sampleToName = remember { mutableStateOf<SensorReading?>(null) }
     val enrollmentStopWasRecorded = remember { mutableStateOf(false) }
-    val mqttHolder = remember { mutableStateOf<MqttController?>(null) }
-    val mqtt = remember {
+    val controllerHolder = remember { mutableStateOf<MqttController?>(null) }
+    var lastStatusUiUpdate by remember { mutableStateOf(0L) }
+    val controller = remember {
         MqttController(
+            context = context,
+            preferences = devicePreferences,
             onConnection = { value -> connection.value = value },
             onEvent = { value -> eventMessage.value = value },
+            onStats = { mqttStats.value = it },
+            onHistory = { event ->
+                localData.saveConnectionEvent(event) { connectionHistory.value = it }
+            },
+            onDecisionDelivery = { state -> decisionDelivery.value = state },
             onMessage = { topic, payload ->
                 when (topic) {
-                    COLOR_TOPIC -> receiveColor(
-                        payload, colors, session.value, learning, sampleToName,
-                        enrollmentStopWasRecorded, allowUnknownColors.value,
-                        mqtt = mqttHolder.value, firebase,
-                        eventMessage
-                    )
-                    STATUS_TOPIC -> receiveStatus(payload, status, eventMessage)
-                    RESULT_TOPIC -> receiveResult(payload, colors, handledResults, firebase, session.value, eventMessage)
+                    COLOR_TOPIC -> {
+                        lastDataReceivedAt.value = System.currentTimeMillis()
+                        receiveColor(
+                            payload, colors, session.value, learning, sampleToName,
+                            enrollmentStopWasRecorded, allowUnknownColors.value,
+                            controller = controllerHolder.value,
+                            firebase = firebase,
+                            localData = localData,
+                            eventMessage = eventMessage
+                        )
+                    }
+                    STATUS_TOPIC -> {
+                        val now = SystemClock.elapsedRealtime()
+                        val minimumRefresh = if (energySavingEnabled.value || systemPowerSave.value) 5_000L else 1_000L
+                        if (now - lastStatusUiUpdate >= minimumRefresh) {
+                            lastStatusUiUpdate = now
+                            lastDataReceivedAt.value = System.currentTimeMillis()
+                            receiveStatus(payload, status, eventMessage)
+                        }
+                    }
+                    RESULT_TOPIC -> {
+                        lastDataReceivedAt.value = System.currentTimeMillis()
+                        receiveResult(
+                            payload,
+                            colors,
+                            handledResults,
+                            processingResults,
+                            controllerHolder.value,
+                            session.value,
+                            localData,
+                            boxHistory,
+                            onHandledResult = { ids ->
+                                devicePreferences.edit()
+                                    .putStringSet(HANDLED_RESULT_IDS_KEY, ids.mapTo(mutableSetOf(), Long::toString))
+                                    .apply()
+                            },
+                            eventMessage = eventMessage
+                        )
+                    }
                 }
             }
         )
     }
-    mqttHolder.value = mqtt
+    controllerHolder.value = controller
+    DisposableEffect(localData) {
+        val pendingObservation = localData.observePendingCount { pendingSyncCount.value = it }
+        onDispose { pendingObservation.cancel() }
+    }
     var firebaseUsers by remember { mutableStateOf<List<FirebaseUserProfile>>(emptyList()) }
     val seedingStarted = remember { mutableStateOf(false) }
+
+    DisposableEffect(context, controller) {
+        fun updateBattery(intent: Intent?) {
+            if (intent == null) return
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, 0)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+            val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+            batteryStatus.value = BatteryStatus((level * 100 / scale).coerceIn(0, 100), plugged)
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_BATTERY_CHANGED -> updateBattery(intent)
+                    PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
+                        systemPowerSave.value = powerManager.isPowerSaveMode
+                        controller.setEnergySavingEnabled(
+                            energySavingEnabled.value || systemPowerSave.value
+                        )
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+        }
+        val stickyIntent = if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
+        updateBattery(stickyIntent)
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
+    DisposableEffect(controller, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> controller.setInForeground(true)
+                Lifecycle.Event.ON_STOP -> controller.setInForeground(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(energySavingEnabled.value, systemPowerSave.value) {
+        controller.setEnergySavingEnabled(energySavingEnabled.value || systemPowerSave.value)
+    }
+
+    LaunchedEffect(firebase) {
+        firebase.restoreSession { result ->
+            result.onSuccess {
+                session.value = it
+                FirebaseSyncScheduler.enqueue(context)
+                eventMessage.value = "Sesión restaurada."
+            }.onFailure {
+                eventMessage.value = "No se pudo restaurar la sesión guardada: ${it.message}"
+            }
+        }
+    }
 
     DisposableEffect(session.value) {
         val currentUser = session.value
@@ -200,10 +328,13 @@ private fun ConveyorApp(
         } else {
             val colorListener = firebase.listenColors(
                 onColors = { loaded ->
-                    colors.clear()
-                    colors.addAll(loaded)
-                    inventoryLoaded.value = loaded.isNotEmpty()
-                    if (loaded.isEmpty() && currentUser.role == ROLE_ADMIN && !seedingStarted.value) {
+                    if (loaded.isNotEmpty()) {
+                        colors.clear()
+                        colors.addAll(loaded)
+                        localData.cacheInventory(loaded)
+                    }
+                    inventoryLoaded.value = colors.isNotEmpty()
+                    if (loaded.isEmpty() && colors.isEmpty() && currentUser.role == ROLE_ADMIN && !seedingStarted.value) {
                         seedingStarted.value = true
                         firebase.seedDefaultColors(defaultColors) { error ->
                             eventMessage.value = "No se pudo inicializar el inventario: ${error.message}"
@@ -212,8 +343,13 @@ private fun ConveyorApp(
                 },
                 onError = { error -> eventMessage.value = "Error al leer inventario: ${error.message}" }
             )
-            val resultListener = firebase.listenResults(
-                onResults = { boxHistory.value = it },
+            val resultListener = if (currentUser.role == ROLE_OPERATOR) null else firebase.listenResults(
+                onResults = {
+                    boxHistory.value = (it + boxHistory.value)
+                        .distinctBy(BoxHistoryEntry::boxId)
+                        .sortedByDescending { entry -> entry.timestamp ?: 0L }
+                        .take(100)
+                },
                 onError = { error -> eventMessage.value = "Error al cargar historial: ${error.message}" }
             )
             val userListener = if (currentUser.role == ROLE_ADMIN) {
@@ -222,6 +358,17 @@ private fun ConveyorApp(
                     onError = { eventMessage.value = "Error al leer usuarios: ${it.message}" }
                 )
             } else null
+            localData.loadInventory { cached ->
+                if (colors.isEmpty() && cached.isNotEmpty()) colors.addAll(cached)
+                inventoryLoaded.value = colors.isNotEmpty()
+            }
+            localData.loadRecentResults { localResults ->
+                boxHistory.value = (localResults + boxHistory.value)
+                    .distinctBy(BoxHistoryEntry::boxId)
+                    .sortedByDescending { it.timestamp ?: 0L }
+                    .take(100)
+            }
+            localData.loadConnectionHistory { connectionHistory.value = it }
             onDispose {
                 colorListener?.remove()
                 resultListener?.remove()
@@ -231,8 +378,13 @@ private fun ConveyorApp(
             }
         }
     }
-    DisposableEffect(mqtt) {
-        onDispose { mqtt.disconnect() }
+    LaunchedEffect(session.value) {
+        if (session.value != null && initialBrokerConfig.host.isNotBlank()) {
+            controller.connect(initialBrokerConfig)
+        }
+    }
+    DisposableEffect(controller) {
+        onDispose { controller.disconnect() }
     }
 
     MaterialTheme(colorScheme = darkColorScheme()) {
@@ -241,14 +393,18 @@ private fun ConveyorApp(
         } else if (session.value == null) {
             LoginScreen(
                 eventMessage = eventMessage.value,
-                onSignIn = { email, password ->
+                attemptLimiter = loginAttemptLimiter,
+                onSignIn = { email, password, onComplete ->
                     eventMessage.value = "Iniciando sesión..."
                     firebase.signIn(email, password) { result ->
                         result.onSuccess {
                             session.value = it
-                            eventMessage.value = "Sesión iniciada como ${if (it.role == ROLE_ADMIN) "administrador" else "usuario"}."
+                            FirebaseSyncScheduler.enqueue(context)
+                            eventMessage.value = "Sesión iniciada como ${roleLabel(it.role)}."
+                            onComplete(true)
                         }.onFailure {
-                            eventMessage.value = "No se pudo iniciar sesión: ${it.message}"
+                            eventMessage.value = "No se pudo iniciar sesión. Verifica tus datos."
+                            onComplete(false)
                         }
                     }
                 },
@@ -257,7 +413,8 @@ private fun ConveyorApp(
                     firebase.register(email, password) { result ->
                         result.onSuccess {
                             session.value = it
-                            eventMessage.value = "Cuenta de usuario creada. Un administrador puede cambiar tu rol."
+                            FirebaseSyncScheduler.enqueue(context)
+                            eventMessage.value = "Cuenta de operador creada. Un administrador puede cambiar tu rol."
                         }.onFailure {
                             eventMessage.value = "No se pudo crear la cuenta: ${it.message}"
                         }
@@ -267,21 +424,31 @@ private fun ConveyorApp(
         } else {
             val currentUser = session.value!!
             ConveyorScreen(
-                initialHost = initialHost,
-                initialPort = initialPort,
-                initialMqttUser = initialMqttUser,
+                initialBrokerConfig = initialBrokerConfig,
                 beltSpeed = beltSpeed.value,
                 allowUnknownColors = allowUnknownColors.value,
                 connection = connection.value,
+                pendingSyncCount = pendingSyncCount.value,
                 status = status.value,
                 colors = colors,
                 boxHistory = boxHistory.value,
+                connectionHistory = connectionHistory.value,
+                batteryStatus = batteryStatus.value,
+                systemPowerSave = systemPowerSave.value,
+                energySavingEnabled = energySavingEnabled.value,
+                mqttStats = mqttStats.value,
+                decisionDelivery = decisionDelivery.value,
+                lastDataReceivedAt = lastDataReceivedAt.value,
                 inventoryLoaded = inventoryLoaded.value,
                 eventMessage = eventMessage.value,
                 user = currentUser,
                 learning = learning.value,
                 sampleToName = sampleToName.value,
                 firebaseUsers = firebaseUsers,
+                onSetEnergySaving = { enabled ->
+                    energySavingEnabled.value = enabled
+                    devicePreferences.edit().putBoolean("energy_saving_enabled", enabled).apply()
+                },
                 onSetAllowUnknownColors = {
                     allowUnknownColors.value = it
                     saveAllowUnknownColors(it)
@@ -289,29 +456,33 @@ private fun ConveyorApp(
                 onApplySpeed = { speed ->
                     beltSpeed.value = speed
                     saveBeltSpeed(speed)
-                    mqtt.publishCommand(
+                    controller.publishCommand(
                         JSONObject().put("accion", "velocidad").put("valor", speed)
                     )
-                    eventMessage.value = "Velocidad solicitada: $speed%."
+                    eventMessage.value = "Velocidad solicitada: $speed pasos/s."
                 },
-                onConnect = { host, port, username, password ->
-                    saveBroker(host, port, username)
-                    handledResults.clear()
-                    mqtt.connect(host, port.toInt(), username, password)
+                onConnect = { config ->
+                    try {
+                        saveBrokerConfig(config)
+                        controller.connect(config)
+                        eventMessage.value = "Configuración del broker guardada. Conectando por Wi-Fi local."
+                    } catch (error: Exception) {
+                        eventMessage.value = "No se pudo cifrar la configuración: ${error.message ?: "error del Keystore"}."
+                    }
                 },
-                onDisconnect = { mqtt.disconnect() },
-                onStart = { mqtt.publishCommand(JSONObject().put("accion", "iniciar")) },
+                onDisconnect = { controller.disconnect() },
+                onStart = { controller.publishCommand(JSONObject().put("accion", "iniciar")) },
                 onStop = { reason ->
-                    mqtt.publishCommand(JSONObject().put("accion", "detener"))
+                    controller.publishCommand(JSONObject().put("accion", "detener"))
                     val stopReason = reason ?: "Parada solicitada por administrador"
-                    eventMessage.value = "Parada enviada. Guardando el registro..."
+                    eventMessage.value = "Parada solicitada. Guardando el registro..."
                     firebase.recordStop(currentUser, stopReason) { result ->
                         result.onSuccess { eventMessage.value = "Parada enviada y motivo registrado." }
-                            .onFailure { eventMessage.value = "La banda recibió la parada, pero Firebase no guardó el motivo: ${it.message}" }
+                            .onFailure { eventMessage.value = "No se pudo registrar la parada: ${it.message}" }
                     }
                 },
                 onBeginEnrollment = {
-                    mqtt.publishCommand(JSONObject().put("accion", "detener"))
+                    controller.publishCommand(JSONObject().put("accion", "detener"))
                     firebase.recordStop(currentUser, "Preparación para dar de alta un color") { result ->
                         result.onFailure { eventMessage.value = "No se pudo registrar la parada de preparación: ${it.message}" }
                     }
@@ -321,12 +492,12 @@ private fun ConveyorApp(
                 },
                 onPassSample = {
                     learning.value = LearningStep.WAITING_FOR_SAMPLE
-                    mqtt.publishCommand(JSONObject().put("accion", "iniciar"))
+                    controller.publishCommand(JSONObject().put("accion", "iniciar"))
                     eventMessage.value = "Pasa una caja de muestra. Al leerla, la app volverá a detener la banda."
                 },
                 onCancelEnrollment = {
                     if (learning.value != LearningStep.OFF) {
-                        mqtt.publishCommand(JSONObject().put("accion", "iniciar"))
+                        controller.publishCommand(JSONObject().put("accion", "iniciar"))
                     }
                     learning.value = LearningStep.OFF
                     sampleToName.value = null
@@ -340,27 +511,18 @@ private fun ConveyorApp(
                         eventMessage.value = "Ya existe un color con ese nombre."
                     } else {
                         val color = InventoryColor(name.trim(), sample.rgb, allowed = allowed)
-                        firebase.saveColor(color) { result ->
-                            result.onSuccess {
-                                if (colors.none { it.id == color.id }) colors.add(color)
-                                sampleToName.value = null
-                                learning.value = LearningStep.OFF
-                                eventMessage.value = "Color ${color.name} guardado en el inventario."
-                            }.onFailure {
-                                eventMessage.value = "No se pudo guardar el color: ${it.message}"
-                            }
-                        }
+                        localData.saveEditedColor(color, currentUser.uid)
+                        if (colors.none { it.id == color.id }) colors.add(color)
+                        sampleToName.value = null
+                        learning.value = LearningStep.OFF
+                        eventMessage.value = "Color ${color.name} guardado localmente; sincronización pendiente."
                     }
                 },
                 onToggleColor = { index ->
                     val color = colors[index]
                     val changed = color.copy(allowed = !color.allowed)
                     colors[index] = changed
-                    firebase.setColorAllowed(changed, changed.allowed) {
-                        val currentIndex = colors.indexOfFirst { it.id == color.id }
-                        if (currentIndex >= 0) colors[currentIndex] = color
-                        eventMessage.value = "No se pudo actualizar ${changed.name}: ${it.message}"
-                    }
+                    localData.saveEditedColor(changed, currentUser.uid)
                 },
                 onSetUserRole = { uid, role ->
                     firebase.setUserRole(uid, role) {
@@ -368,10 +530,9 @@ private fun ConveyorApp(
                     }
                 },
                 onSignOut = {
-                    mqtt.disconnect()
+                    controller.disconnect()
                     firebase.signOut()
                     session.value = null
-                    handledResults.clear()
                     learning.value = LearningStep.OFF
                     sampleToName.value = null
                     eventMessage.value = "Sesión cerrada."
@@ -401,11 +562,31 @@ private fun FirebaseSetupRequired() {
 @Composable
 private fun LoginScreen(
     eventMessage: String,
-    onSignIn: (String, String) -> Unit,
+    attemptLimiter: LoginAttemptLimiter,
+    onSignIn: (String, String, (Boolean) -> Unit) -> Unit,
     onRegister: (String, String) -> Unit
 ) {
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var isSigningIn by remember { mutableStateOf(false) }
+    var lockoutUntil by remember { mutableStateOf(0L) }
+    var lockoutSeconds by remember { mutableStateOf(0) }
+    var remainingAttempts by remember { mutableStateOf<Int?>(null) }
+
+    LaunchedEffect(lockoutUntil) {
+        val deadline = lockoutUntil
+        while (deadline > 0L) {
+            val remainingMillis = deadline - SystemClock.elapsedRealtime()
+            if (remainingMillis <= 0L) {
+                lockoutUntil = 0L
+                lockoutSeconds = 0
+                break
+            }
+            lockoutSeconds = ((remainingMillis + 999) / 1000).toInt()
+            delay(minOf(remainingMillis, 1000L))
+        }
+    }
+
     Surface(Modifier.fillMaxSize(), color = Color(0xFF0A0F1C)) {
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -416,11 +597,7 @@ private fun LoginScreen(
                 Spacer(Modifier.size(12.dp))
                 Text("Banda transportadora", style = MaterialTheme.typography.headlineSmall, color = Color.White)
             }
-            Text("Acceso con Firebase · administrador o usuario", color = Color(0xFF9AA7C2))
-            Text(
-                "Primero inicia sesión con Firebase. Después, en la pantalla principal, pulsa «Conectar a Mosquitto» para configurar MQTT.",
-                color = Color(0xFF9AA7C2)
-            )
+            Text("Ingresa para continuar", color = Color(0xFF9AA7C2))
             Spacer(Modifier.height(16.dp))
             OutlinedTextField(email, { email = it }, Modifier.fillMaxWidth(), label = { Text("Correo") }, singleLine = true)
             OutlinedTextField(
@@ -430,17 +607,42 @@ private fun LoginScreen(
             )
             Spacer(Modifier.height(10.dp))
             Button(
-                onClick = { onSignIn(email.trim(), password) },
-                enabled = email.contains("@") && password.isNotBlank(),
+                onClick = {
+                    isSigningIn = true
+                    onSignIn(email.trim(), password) { succeeded ->
+                        isSigningIn = false
+                        if (succeeded) {
+                            attemptLimiter.reset()
+                            remainingAttempts = null
+                        } else {
+                            val attempt = attemptLimiter.recordFailure(SystemClock.elapsedRealtime())
+                            remainingAttempts = attempt.remainingAttempts.takeIf { it > 0 }
+                            if (attempt.lockoutMillis > 0L) {
+                                lockoutUntil = SystemClock.elapsedRealtime() + attempt.lockoutMillis
+                            }
+                        }
+                    }
+                },
+                enabled = email.contains("@") && password.isNotBlank() &&
+                    !isSigningIn && lockoutUntil == 0L,
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("Iniciar sesión") }
+            ) { Text(if (isSigningIn) "Validando..." else "Iniciar sesión") }
             OutlinedButton(
                 onClick = { onRegister(email.trim(), password) },
-                enabled = email.contains("@") && password.length >= 6,
+                enabled = email.contains("@") && password.length >= 6 && !isSigningIn,
                 modifier = Modifier.fillMaxWidth()
             ) { Text("Crear cuenta de usuario") }
-            Spacer(Modifier.height(10.dp))
-            Text("La primera cuenta también nace como usuario. El tutorial explica cómo nombrar al primer administrador sin poner una contraseña secreta en el código.", color = Color(0xFF9AA7C2))
+            if (lockoutSeconds > 0) {
+                Text(
+                    "Demasiados intentos. Prueba de nuevo en $lockoutSeconds s.",
+                    color = Color(0xFFFF6B6B)
+                )
+            } else if (remainingAttempts != null) {
+                Text(
+                    "Intentos restantes: $remainingAttempts",
+                    color = Color(0xFFFF6B6B)
+                )
+            }
             Text(eventMessage, Modifier.padding(top = 12.dp), color = Color(0xFF9FCBFF))
         }
     }
@@ -448,24 +650,31 @@ private fun LoginScreen(
 
 @Composable
 private fun ConveyorScreen(
-    initialHost: String,
-    initialPort: String,
-    initialMqttUser: String,
+    initialBrokerConfig: BrokerConfig,
     beltSpeed: Int,
     allowUnknownColors: Boolean,
     connection: String,
+    pendingSyncCount: Int,
     status: ConveyorStatus,
     colors: List<InventoryColor>,
     boxHistory: List<BoxHistoryEntry>,
+    connectionHistory: List<ConnectionHistoryItem>,
+    batteryStatus: BatteryStatus,
+    systemPowerSave: Boolean,
+    energySavingEnabled: Boolean,
+    mqttStats: MqttTrafficStats,
+    decisionDelivery: DecisionDeliveryState?,
+    lastDataReceivedAt: Long?,
     inventoryLoaded: Boolean,
     eventMessage: String,
     user: AppUser,
     learning: LearningStep,
     sampleToName: SensorReading?,
     firebaseUsers: List<FirebaseUserProfile>,
+    onSetEnergySaving: (Boolean) -> Unit,
     onSetAllowUnknownColors: (Boolean) -> Unit,
     onApplySpeed: (Int) -> Unit,
-    onConnect: (String, String, String, String) -> Unit,
+    onConnect: (BrokerConfig) -> Unit,
     onDisconnect: () -> Unit,
     onStart: () -> Unit,
     onStop: (String?) -> Unit,
@@ -477,20 +686,25 @@ private fun ConveyorScreen(
     onSetUserRole: (String, String) -> Unit,
     onSignOut: () -> Unit
 ) {
-    var host by remember { mutableStateOf(initialHost) }
-    var port by remember { mutableStateOf(initialPort) }
-    var mqttUsername by remember { mutableStateOf(initialMqttUser) }
-    var mqttPassword by remember { mutableStateOf("") }
+    var host by remember(initialBrokerConfig.host) { mutableStateOf(initialBrokerConfig.host) }
+    var port by remember(initialBrokerConfig.port) { mutableStateOf(initialBrokerConfig.port.toString()) }
+    var username by remember(initialBrokerConfig.username) { mutableStateOf(initialBrokerConfig.username) }
+    var password by remember(initialBrokerConfig.password) { mutableStateOf(initialBrokerConfig.password) }
+    var tls by remember(initialBrokerConfig.tls) { mutableStateOf(initialBrokerConfig.tls) }
     var showStopDialog by remember { mutableStateOf(false) }
     var stopReason by remember { mutableStateOf("") }
     var sampleName by remember(sampleToName?.id) { mutableStateOf("") }
     var sampleAllowed by remember { mutableStateOf(true) }
     var pendingSpeed by remember(beltSpeed) { mutableStateOf(beltSpeed.toFloat()) }
-    var page by remember { mutableStateOf(AppPage.HOME) }
+    var page by remember(user.role) {
+        mutableStateOf(if (user.role == ROLE_OPERATOR) AppPage.INVENTORY else AppPage.HOME)
+    }
     val connected = connection == "Conectado"
     val isAdmin = user.role == ROLE_ADMIN
-    BackHandler(enabled = page != AppPage.HOME) {
-        page = AppPage.HOME
+    val canControl = user.role == ROLE_MAINTENANCE || isAdmin
+    val homePage = if (user.role == ROLE_OPERATOR) AppPage.INVENTORY else AppPage.HOME
+    BackHandler(enabled = page != homePage) {
+        page = homePage
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF0A0F1C)) {
@@ -511,24 +725,46 @@ private fun ConveyorScreen(
                             AppPage.HOME -> "Banda transportadora"
                             AppPage.INVENTORY -> "Inventario"
                             AppPage.SETTINGS -> "Configuración"
+                            AppPage.ENERGY -> "Energía"
+                            AppPage.HISTORY -> "Historial de conexión"
                         },
                         style = MaterialTheme.typography.headlineSmall,
                         color = Color.White
                     )
                     Text(
-                        "${user.email} · ${if (isAdmin) "ADMINISTRADOR" else "USUARIO"}",
+                        "${user.email} · ${roleLabel(user.role).uppercase()}",
                         color = Color(0xFF9AA7C2),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                if (page != AppPage.HOME) {
+                if (page != AppPage.HOME && user.role != ROLE_OPERATOR) {
                     OutlinedButton(onClick = { page = AppPage.HOME }) { Text("Volver") }
                 }
             }
 
+            if (user.role != ROLE_OPERATOR) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(onClick = { page = AppPage.HOME }) { Text("Banda") }
+                    OutlinedButton(onClick = { page = AppPage.INVENTORY }) { Text("Inventario") }
+                    OutlinedButton(onClick = { page = AppPage.ENERGY }) { Text("Energía") }
+                    OutlinedButton(onClick = { page = AppPage.HISTORY }) { Text("Historial") }
+                    OutlinedButton(onClick = { page = AppPage.SETTINGS }) { Text("Ajustes") }
+                }
+            }
+
+            if (!connected && page != AppPage.HOME && page != AppPage.INVENTORY) {
+                ConnectionWarningCard(connection, lastDataReceivedAt, status)
+            }
+
             when (page) {
                 AppPage.HOME -> {
+                    if (!connected) {
+                        ConnectionWarningCard(connection, lastDataReceivedAt, status)
+                    }
                     Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
                         Column(
                             Modifier.fillMaxWidth().padding(16.dp),
@@ -567,6 +803,20 @@ private fun ConveyorScreen(
                                     if (connected) Color(0xFF6FE28A) else Color(0xFFFFB84D)
                                 )
                             }
+                            if (status.receivedAt != null) {
+                                Text(
+                                    "Último estado: ${formatDateTime(status.receivedAt)}",
+                                    color = Color(0xFF9AA7C2),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            if (pendingSyncCount > 0) {
+                                Text(
+                                    "Registros pendientes de sincronizar con Firebase: $pendingSyncCount",
+                                    color = Color(0xFFFFD27C),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
                         }
                     }
 
@@ -578,13 +828,22 @@ private fun ConveyorScreen(
                         ) {
                             ConveyorLogo(Modifier.size(42.dp))
                             Column(Modifier.weight(1f)) {
+                                val esp32Reported = status.receivedAt != null
                                 Text(
-                                    if (connected) "MQTT conectado" else "MQTT desconectado",
+                                    when {
+                                        !connected -> "Broker MQTT desconectado"
+                                        esp32Reported -> "Estado recibido del ESP32"
+                                        else -> "Broker conectado; esperando estado ESP32"
+                                    },
                                     color = Color.White,
                                     style = MaterialTheme.typography.titleSmall
                                 )
                                 Text(
-                                    "Broker, velocidad y cuentas",
+                                    if (esp32Reported) {
+                                        "Último estado: ${formatDateTime(status.receivedAt!!)}"
+                                    } else {
+                                        "La conexión con el broker no confirma todavía al ESP32."
+                                    },
                                     color = Color(0xFFB8C6DF),
                                     style = MaterialTheme.typography.bodySmall
                                 )
@@ -595,9 +854,16 @@ private fun ConveyorScreen(
                         }
                     }
 
-                    UnknownColorPolicyCard(allowUnknownColors, onSetAllowUnknownColors)
+                    if (isAdmin) UnknownColorPolicyCard(
+                        allowUnknownColors,
+                        onSetAllowUnknownColors
+                    )
+                    if (canControl) QueuedCommandsCard(
+                        state = decisionDelivery,
+                        automaticRejectionEnabled = !allowUnknownColors
+                    )
 
-                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+                    if (canControl) Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
                         Column(
                             Modifier.fillMaxWidth().padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -613,15 +879,17 @@ private fun ConveyorScreen(
                             )
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button(
-                                    enabled = inventoryLoaded && connected && learning == LearningStep.OFF,
+                                    enabled = connected && inventoryLoaded && learning == LearningStep.OFF,
                                     onClick = {
                                         if (isAdmin) onStop(null) else showStopDialog = true
                                     }
                                 ) { Text("Detener banda") }
-                                Button(
-                                    enabled = inventoryLoaded && connected && learning == LearningStep.OFF,
-                                    onClick = onStart
-                                ) { Text("Iniciar banda") }
+                                if (isAdmin) {
+                                    Button(
+                                        enabled = connected && inventoryLoaded && learning == LearningStep.OFF,
+                                        onClick = onStart
+                                    ) { Text("Iniciar banda") }
+                                }
                             }
                         }
                     }
@@ -638,6 +906,13 @@ private fun ConveyorScreen(
                 }
 
                 AppPage.INVENTORY -> {
+                    if (!connected) ConnectionWarningCard(connection, lastDataReceivedAt, status)
+                    if (pendingSyncCount > 0) {
+                        Text(
+                            "Registros pendientes de sincronizar con Firebase: $pendingSyncCount",
+                            color = Color(0xFFFFD27C)
+                        )
+                    }
                     Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
                         Column(
                             Modifier.fillMaxWidth().padding(16.dp),
@@ -751,6 +1026,12 @@ private fun ConveyorScreen(
                         }
                     }
 
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+                        OutlinedButton(onClick = onSignOut, modifier = Modifier.fillMaxWidth()) {
+                            Text("Cerrar sesión")
+                        }
+                    }
+
                     Text(eventMessage, color = Color(0xFF9FCBFF), style = MaterialTheme.typography.bodyMedium)
                 }
 
@@ -760,100 +1041,109 @@ private fun ConveyorScreen(
                             Modifier.fillMaxWidth().padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text("Conexión MQTT (TCP)", style = MaterialTheme.typography.titleMedium, color = Color.White)
+                            Text("Conexión MQTT local", style = MaterialTheme.typography.titleMedium, color = Color.White)
                             OutlinedTextField(
                                 host,
                                 { host = it },
                                 Modifier.fillMaxWidth(),
-                                label = { Text("IP o nombre del broker") },
+                                label = { Text("IP local del broker") },
                                 singleLine = true
                             )
                             OutlinedTextField(
                                 port,
                                 { port = it.filter(Char::isDigit).take(5) },
                                 Modifier.fillMaxWidth(),
-                                label = { Text("Puerto TCP") },
+                                label = { Text("Puerto") },
                                 singleLine = true
                             )
                             OutlinedTextField(
-                                mqttUsername,
-                                { mqttUsername = it.trim() },
+                                username,
+                                { username = it },
                                 Modifier.fillMaxWidth(),
-                                label = { Text("Usuario MQTT") },
+                                label = { Text("Usuario del broker") },
                                 singleLine = true
                             )
                             OutlinedTextField(
-                                mqttPassword,
-                                { mqttPassword = it },
+                                password,
+                                { password = it },
                                 Modifier.fillMaxWidth(),
-                                label = { Text("Contraseña MQTT") },
+                                label = { Text("Clave del broker") },
                                 singleLine = true,
                                 visualTransformation = PasswordVisualTransformation()
                             )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Switch(
+                                    checked = tls,
+                                    onCheckedChange = { enabled ->
+                                        tls = enabled
+                                        if (enabled && port == "1883") port = "8883"
+                                        if (!enabled && port == "8883") port = "1883"
+                                    }
+                                )
+                                Text("Usar TLS", color = Color.White)
+                            }
                             Text(
-                                "Topics: banda/sensor/color, banda/estado, banda/resultado y banda/comandos",
+                                "El teléfono, el ESP32 y el broker deben usar la misma Wi-Fi local. Usuario y clave se cifran con Android Keystore. TLS usa el certificado de confianza del teléfono.",
                                 color = Color(0xFF9AA7C2),
                                 style = MaterialTheme.typography.bodySmall
                             )
-                            Text("La contraseña no se guarda en el teléfono.", color = Color(0xFF9AA7C2), style = MaterialTheme.typography.bodySmall)
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button(
-                                    enabled = inventoryLoaded && !connected &&
-                                        connection != "Conectando..." && connection != "Reconectando..." &&
-                                        host.isNotBlank() && (port.toIntOrNull() ?: 0) in 1..65535 &&
-                                        mqttUsername.isNotBlank() && mqttPassword.isNotBlank(),
-                                    onClick = { onConnect(host.trim(), port, mqttUsername, mqttPassword) }
+                                    enabled = host.isNotBlank() && (port.toIntOrNull()?.let { it in 1..65535 } == true),
+                                    onClick = {
+                                        onConnect(
+                                            BrokerConfig(host.trim(), port.toInt(), username.trim(), password, tls)
+                                        )
+                                    }
                                 ) {
-                                    Text(
-                                        connection.takeIf {
-                                            it == "Conectando..." || it == "Reconectando..."
-                                        } ?: "Conectar"
-                                    )
+                                    Text("Guardar y conectar")
                                 }
                                 OutlinedButton(
-                                    enabled = connection != "Desconectado",
+                                    enabled = connection != "Sin conexión",
                                     onClick = onDisconnect
                                 ) { Text("Desconectar") }
-                            }
-                            if (!inventoryLoaded) {
-                                Text(
-                                    "Cargando inventario de Firebase; MQTT se habilitará al terminar.",
-                                    color = Color(0xFFFFD27C)
-                                )
                             }
                         }
                     }
 
-                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+                    if (canControl) Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
                         Column(
                             Modifier.fillMaxWidth().padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text("Velocidad de la banda", style = MaterialTheme.typography.titleMedium, color = Color.White)
                             Text(
-                                "${pendingSpeed.toInt()}% · se envía al ESP32 como comando MQTT",
+                                "${pendingSpeed.toInt()} pasos/s · se guarda y envía al ESP32",
                                 color = Color(0xFF9AA7C2)
                             )
                             Slider(
                                 value = pendingSpeed,
                                 onValueChange = { pendingSpeed = it },
                                 valueRange = 10f..100f,
-                                steps = 8
+                                steps = 89,
+                                enabled = connected
                             )
                             Button(
-                                enabled = connected,
                                 onClick = { onApplySpeed(pendingSpeed.toInt()) },
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = connected
                             ) { Text("Aplicar velocidad") }
                             Text(
-                                "El firmware debe atender {\"accion\":\"velocidad\",\"valor\":N} (porcentaje).",
+                                "El valor solicitado va de 10 a 100 pasos/s; el ESP32 ajusta el intervalo del motor.",
                                 color = Color(0xFF9AA7C2),
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                     }
 
-                    UnknownColorPolicyCard(allowUnknownColors, onSetAllowUnknownColors)
+                    if (isAdmin) UnknownColorPolicyCard(
+                        allowUnknownColors,
+                        onSetAllowUnknownColors
+                    )
+                    if (canControl) QueuedCommandsCard(
+                        state = decisionDelivery,
+                        automaticRejectionEnabled = !allowUnknownColors
+                    )
 
                     if (isAdmin) {
                         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
@@ -862,6 +1152,7 @@ private fun ConveyorScreen(
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text("Cuentas y roles", style = MaterialTheme.typography.titleMedium, color = Color.White)
+                                Text("Operador: inventario · Mantenimiento: controles y velocidad · Administrador: colores y usuarios", color = Color(0xFF9AA7C2))
                                 if (firebaseUsers.isEmpty()) {
                                     Text("No hay otras cuentas cargadas.", color = Color(0xFF9AA7C2))
                                 }
@@ -869,18 +1160,27 @@ private fun ConveyorScreen(
                                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                         Column(Modifier.weight(1f)) {
                                             Text(profile.email, color = Color.White)
-                                            Text(profile.uid, color = Color(0xFF9AA7C2), style = MaterialTheme.typography.bodySmall)
                                         }
                                         OutlinedButton(
                                             enabled = profile.uid != user.uid,
                                             onClick = {
+                                                val nextRole = when (profile.role) {
+                                                    ROLE_OPERATOR, "usuario" -> ROLE_MAINTENANCE
+                                                    ROLE_MAINTENANCE -> ROLE_ADMIN
+                                                    else -> ROLE_OPERATOR
+                                                }
                                                 onSetUserRole(
                                                     profile.uid,
-                                                    if (profile.role == ROLE_ADMIN) ROLE_USER else ROLE_ADMIN
+                                                    nextRole
                                                 )
                                             }
                                         ) {
-                                            Text(if (profile.role == ROLE_ADMIN) "Hacer usuario" else "Hacer admin")
+                                            val nextRole = when (profile.role) {
+                                                ROLE_OPERATOR, "usuario" -> ROLE_MAINTENANCE
+                                                ROLE_MAINTENANCE -> ROLE_ADMIN
+                                                else -> ROLE_OPERATOR
+                                            }
+                                            Text("Cambiar a ${roleLabel(nextRole)}")
                                         }
                                     }
                                 }
@@ -897,6 +1197,16 @@ private fun ConveyorScreen(
                     }
                     Text(eventMessage, color = Color(0xFF9FCBFF), style = MaterialTheme.typography.bodyMedium)
                 }
+
+                AppPage.ENERGY -> {
+                    EnergyPanel(
+                        batteryStatus, systemPowerSave, energySavingEnabled, connection,
+                        mqttStats, onSetEnergySaving
+                    )
+                    Text(eventMessage, color = Color(0xFF9FCBFF), style = MaterialTheme.typography.bodyMedium)
+                }
+
+                AppPage.HISTORY -> ConnectionHistoryCard(connectionHistory)
             }
         }
     }
@@ -954,6 +1264,196 @@ private fun ConveyorLogo(modifier: Modifier = Modifier) {
 }
 
 @Composable
+private fun ConnectionWarningCard(
+    connection: String,
+    lastDataReceivedAt: Long?,
+    status: ConveyorStatus
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF4A2D16))) {
+        Column(
+            Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text("Sin conexión con el broker", color = Color.White, style = MaterialTheme.typography.titleSmall)
+            Text("Controles de banda deshabilitados. Se conservan en pantalla los últimos datos.", color = Color(0xFFFFD7A0))
+            Text(
+                "Estado: $connection · último dato: ${lastDataReceivedAt?.let(::formatDateTime) ?: "sin datos recibidos"}",
+                color = Color(0xFFFFE5C2),
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                status.receivedAt?.let {
+                    "Último estado conservado: ${status.belt} · ${status.speed} · ${formatDateTime(it)}"
+                } ?: "Todavía no se recibió un estado válido.",
+                color = Color(0xFFFFE5C2),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun QueuedCommandsCard(
+    state: DecisionDeliveryState?,
+    automaticRejectionEnabled: Boolean
+) {
+    if (state == null) {
+        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Comandos en cola", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                Text("No hay comandos pendientes de Wi-Fi/MQTT.", color = Color(0xFFB8C6DF), style = MaterialTheme.typography.bodySmall)
+                Text(
+                    if (automaticRejectionEnabled) {
+                        "Rechazo automático preparado en cola: al llegar una caja no permitida, se enviará al recuperar Wi-Fi/MQTT."
+                    } else {
+                        "Rechazo automático desactivado."
+                    },
+                    color = if (automaticRejectionEnabled) Color(0xFF6FE28A) else Color(0xFF9AA7C2),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text("Iniciar, detener y velocidad permanecen deshabilitados sin conexión.", color = Color(0xFF9AA7C2), style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        return
+    }
+    var now by remember(state.id, state.status, state.expiresAtElapsed) {
+        mutableStateOf(SystemClock.elapsedRealtime())
+    }
+    if (state.status == DecisionDeliveryStatus.QUEUED_FOR_WIFI) {
+        LaunchedEffect(state.id, state.expiresAtElapsed) {
+            while (state.expiresAtElapsed != null && now < state.expiresAtElapsed) {
+                delay(1_000L)
+                now = SystemClock.elapsedRealtime()
+            }
+        }
+    }
+    val action = if (state.action == "expulsar") "Rechazo automático" else "Decisión automática"
+    val remainingSeconds = state.expiresAtElapsed?.let {
+        ((it - now).coerceAtLeast(0L) + 999L) / 1_000L
+    }
+    val (title, description, color) = when (state.status) {
+        DecisionDeliveryStatus.QUEUED_FOR_WIFI -> Triple(
+            "$action en cola · caja ${state.id}",
+            "El dato se enviará cuando se conecte a Wi-Fi/MQTT. Tiempo disponible: ${remainingSeconds ?: 0} s; la banda permanece pausada.",
+            Color(0xFFFFD27C)
+        )
+        DecisionDeliveryStatus.PUBLISHED_TO_BROKER -> Triple(
+            "$action publicado · caja ${state.id}",
+            "El broker confirmó la publicación. Esperando banda/resultado para confirmar que el ESP32 ejecutó la decisión.",
+            Color(0xFF9FCBFF)
+        )
+        DecisionDeliveryStatus.CONFIRMED_BY_ESP32 -> Triple(
+            "Interacción confirmada · caja ${state.id}",
+            "El ESP32 publicó banda/resultado: la decisión llegó y la operación quedó confirmada.",
+            Color(0xFF6FE28A)
+        )
+        DecisionDeliveryStatus.EXPIRED -> Triple(
+            "$action vencido · caja ${state.id}",
+            "No se envió dentro de 10 s. Se descartó para no actuar sobre una caja diferente.",
+            Color(0xFFFF6B6B)
+        )
+    }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Comandos en cola", color = Color.White, style = MaterialTheme.typography.titleSmall)
+            Text(title, color = color, style = MaterialTheme.typography.titleSmall)
+            Text(description, color = Color(0xFFB8C6DF), style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun EnergyPanel(
+    battery: BatteryStatus,
+    systemPowerSave: Boolean,
+    energySavingEnabled: Boolean,
+    connection: String,
+    mqttStats: MqttTrafficStats,
+    onSetEnergySaving: (Boolean) -> Unit
+) {
+    val activeEnergySaving = energySavingEnabled || systemPowerSave
+    val connected = connection == "Conectado"
+    var now by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(connected, activeEnergySaving, mqttStats.sampledAtElapsed) {
+        while (connected) {
+            delay(if (activeEnergySaving) 10_000L else 1_000L)
+            now = SystemClock.elapsedRealtime()
+        }
+    }
+    val connectedMillis = mqttStats.connectedMillis +
+        if (connected) (now - mqttStats.sampledAtElapsed).coerceAtLeast(0L) else 0L
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+        Column(
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("Energía", style = MaterialTheme.typography.titleMedium, color = Color.White)
+            Text("Batería: ${battery.percentage}% · ${if (battery.charging) "cargando" else "sin carga"}", color = Color.White)
+            Text("Ahorro del teléfono: ${if (systemPowerSave) "activo" else "inactivo"}", color = Color(0xFFB8C6DF))
+            Text("Tiempo conectado al broker: ${formatDuration(connectedMillis)}", color = Color(0xFFB8C6DF))
+            Text("Mensajes enviados: ${mqttStats.sent} · recibidos: ${mqttStats.received}", color = Color(0xFFB8C6DF))
+            Text("Keep-alive: ${if (activeEnergySaving) 120 else 30} s · QoS de banda/estado: ${if (activeEnergySaving) 0 else 1}", color = Color(0xFFB8C6DF))
+            Text("ESP32: ahorro Wi-Fi activo; sensor a 20 % y lectura cada 150 ms mientras la banda avanza. Las bobinas se liberan al detenerse o esperar una decisión.", color = Color(0xFFB8C6DF), style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = activeEnergySaving,
+                    onCheckedChange = onSetEnergySaving,
+                    enabled = !systemPowerSave
+                )
+                Column {
+                    Text("Modo ahorro de energía", color = Color.White)
+                    if (systemPowerSave) {
+                        Text("Activado por el sistema; se mantendrá activo mientras dure el ahorro del teléfono.", color = Color(0xFFFFD27C), style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+            Text(
+                "El estado MQTT actualiza la interfaz con menor frecuencia cuando el ahorro está activo.",
+                color = Color(0xFF9AA7C2),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConnectionHistoryCard(events: List<ConnectionHistoryItem>) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151E30))) {
+        Column(
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("Historial de conexión", style = MaterialTheme.typography.titleMedium, color = Color.White)
+            if (events.isEmpty()) Text("Aún no hay cortes ni recuperaciones registrados.", color = Color(0xFF9AA7C2))
+            events.take(30).forEach { event ->
+                Text(
+                    "${if (event.connected) "Conexión recuperada" else "Conexión perdida"} · ${formatDateTime(event.occurredAt)}",
+                    color = if (event.connected) Color(0xFF6FE28A) else Color(0xFFFFB84D)
+                )
+            }
+        }
+    }
+}
+
+private fun formatDateTime(timestamp: Long): String =
+    DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(Date(timestamp))
+
+private fun formatDuration(durationMillis: Long): String {
+    val totalSeconds = durationMillis.coerceAtLeast(0L) / 1000
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
+    val seconds = totalSeconds % 60
+    return if (hours > 0) "%d h %02d min".format(hours, minutes) else "%02d min %02d s".format(minutes, seconds)
+}
+
+private fun roleLabel(role: String): String = when (role) {
+    ROLE_ADMIN -> "Administrador"
+    ROLE_MAINTENANCE -> "Mantenimiento"
+    ROLE_OPERATOR, "usuario" -> "Operador"
+    else -> "Rol no reconocido"
+}
+
+@Composable
 private fun UnknownColorPolicyCard(
     allowUnknownColors: Boolean,
     onSetAllowUnknownColors: (Boolean) -> Unit
@@ -980,7 +1480,7 @@ private fun UnknownColorPolicyCard(
                 onClick = { onSetAllowUnknownColors(!allowUnknownColors) },
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(if (allowUnknownColors) "Activar rechazo automático" else "Rechazo automático activado")
+                Text(if (allowUnknownColors) "Activar rechazo automático" else "Desactivar rechazo automático")
             }
         }
     }
@@ -1099,17 +1599,19 @@ private fun receiveColor(
     sampleToName: androidx.compose.runtime.MutableState<SensorReading?>,
     enrollmentStopWasRecorded: androidx.compose.runtime.MutableState<Boolean>,
     allowUnknownColors: Boolean,
-    mqtt: MqttController?,
+    controller: MqttController?,
     firebase: FirebaseRepository,
+    localData: LocalDataRepository,
     eventMessage: androidx.compose.runtime.MutableState<String>
 ) {
     try {
-        val json = JSONObject(payload)
-        val id = json.opt("id") as? Number ?: throw JSONException("La lectura no incluye un id numérico.")
-        val reading = SensorReading(id.toLong(), parseRgb(json))
+        val valid = MqttJsonValidator.color(payload)
+        val uid = user?.uid ?: return
+        val reading = SensorReading(valid.id, valid.rgb)
+        localData.saveReading(payload, uid)
         if (user?.role == ROLE_ADMIN && learning.value == LearningStep.WAITING_FOR_SAMPLE) {
-            mqtt?.publishCommand(JSONObject().put("accion", "aceptar").put("id", id))
-            mqtt?.publishCommand(JSONObject().put("accion", "detener"))
+            controller?.publishCommand(JSONObject().put("accion", "aceptar").put("id", valid.id))
+            controller?.publishCommand(JSONObject().put("accion", "detener"))
             if (enrollmentStopWasRecorded.value) {
                 firebase.recordStop(user, "Parada automática para capturar una muestra de color") {
                     it.onFailure { error ->
@@ -1123,9 +1625,9 @@ private fun receiveColor(
             return
         }
         val action = decisionFor(reading.rgb, colors, allowUnknownColors)
-        mqtt?.publishCommand(JSONObject().put("accion", action).put("id", id))
+        controller?.publishCommand(JSONObject().put("accion", action).put("id", valid.id))
         eventMessage.value = "Caja ${reading.id}: RGB(${reading.rgb.red}, ${reading.rgb.green}, ${reading.rgb.blue}) → $action"
-    } catch (error: JSONException) {
+    } catch (error: Exception) {
         eventMessage.value = "Lectura inválida: ${error.message ?: "JSON incorrecto"}"
     }
 }
@@ -1136,23 +1638,17 @@ private fun receiveStatus(
     eventMessage: androidx.compose.runtime.MutableState<String>
 ) {
     try {
-        val json = JSONObject(payload)
-        val speedValue = when (val value = json.opt("velocidad")) {
-            is Number -> value.toString()
-            is String -> value.takeIf(String::isNotBlank)
-            else -> null
-        }
-        val speedUnit = json.optString("unidadVelocidad")
-            .takeUnless { it.isBlank() || it == "null" }
+        val parsed = MqttJsonValidator.status(payload)
         status.value = ConveyorStatus(
-            belt = json.optString("banda", "Sin datos"),
-            sensor = json.optString("sensor", "Sin datos"),
-            servo = json.optString("servo", "Sin datos"),
-            accepted = json.optInt("aceptadas", status.value.accepted),
-            rejected = json.optInt("expulsadas", status.value.rejected),
-            speed = speedValue?.let { listOfNotNull(it, speedUnit).joinToString(" ") } ?: "Sin datos"
+            belt = parsed.belt,
+            sensor = parsed.sensor,
+            servo = parsed.servo.toString(),
+            accepted = parsed.accepted,
+            rejected = parsed.rejected,
+            speed = "${parsed.speed} ${parsed.speedUnit}",
+            receivedAt = System.currentTimeMillis()
         )
-    } catch (error: JSONException) {
+    } catch (error: Exception) {
         eventMessage.value = "Estado inválido: ${error.message ?: "JSON incorrecto"}"
     }
 }
@@ -1161,41 +1657,54 @@ private fun receiveResult(
     payload: String,
     colors: MutableList<InventoryColor>,
     handledResults: MutableSet<Long>,
-    firebase: FirebaseRepository,
+    processingResults: MutableSet<Long>,
+    controller: MqttController?,
     session: AppUser?,
+    localData: LocalDataRepository,
+    boxHistory: androidx.compose.runtime.MutableState<List<BoxHistoryEntry>>,
+    onHandledResult: (Set<Long>) -> Unit,
     eventMessage: androidx.compose.runtime.MutableState<String>
 ) {
     try {
-        val json = JSONObject(payload)
-        val id = json.opt("id") as? Number ?: throw JSONException("El resultado no incluye un id numérico.")
-        val rgb = parseRgb(json)
-        val result = json.optString("resultado")
-        if (result != "aceptada" && result != "expulsada") {
-            throw JSONException("Resultado desconocido: $result")
-        }
-        if (!handledResults.add(id.toLong())) return
-
-        val index = nearestColorIndex(rgb, colors)
+        val parsed = MqttJsonValidator.result(payload)
+        val id = parsed.id
+        val rgb = parsed.rgb
+        val result = parsed.result
         val uid = session?.uid ?: return
-        if (index == -1) {
-            firebase.recordUnregisteredResult(rgb, result, uid, id.toLong()) { error ->
-                eventMessage.value = "La caja no está inventariada y Firebase no guardó su historial: ${error.message}"
-            }
-            eventMessage.value = "Caja $id $result · color no inventariado"
+        if (id in handledResults) {
+            controller?.publishCommand(JSONObject().put("accion", "resultado_ack").put("id", id))
             return
         }
-        val color = colors[index]
-        val updated = if (result == "aceptada") {
-            color.copy(accepted = color.accepted + 1)
-        } else {
-            color.copy(rejected = color.rejected + 1)
+        if (!processingResults.add(id)) return
+        val index = nearestColorIndex(rgb, colors)
+        val color = colors.getOrNull(index)
+        localData.saveResult(payload, uid, color) { stored ->
+            processingResults.remove(id)
+            stored.onSuccess {
+                if (color != null) {
+                    colors[index] = if (result == "aceptada") {
+                        color.copy(accepted = color.accepted + 1)
+                    } else {
+                        color.copy(rejected = color.rejected + 1)
+                    }
+                    localData.cacheInventory(colors)
+                }
+                handledResults.add(id)
+                while (handledResults.size > 500) handledResults.remove(handledResults.minOrNull()!!)
+                onHandledResult(handledResults)
+                val displayedName = color?.name ?: "No inventariado"
+                val history = BoxHistoryEntry(id.toString(), displayedName, rgb, result, System.currentTimeMillis())
+                boxHistory.value = listOf(history) + boxHistory.value.filterNot { it.boxId == id.toString() }.take(99)
+                eventMessage.value = "Caja $id $result · $displayedName · guardada localmente"
+                controller?.publishCommand(
+                    JSONObject().put("accion", "resultado_ack").put("id", id)
+                )
+            }.onFailure { error ->
+                eventMessage.value =
+                    "No se pudo guardar el resultado de la caja $id; el ESP32 lo reenviará: ${error.message ?: "error local"}"
+            }
         }
-        colors[index] = updated
-        firebase.recordResult(color, result, uid, id.toLong()) {
-            eventMessage.value = "La caja quedó contada en pantalla, pero Firebase no guardó el resultado: ${it.message}"
-        }
-        eventMessage.value = "Caja $id $result · ${color.name}"
-    } catch (error: JSONException) {
+    } catch (error: Exception) {
         eventMessage.value = "Resultado inválido: ${error.message ?: "JSON incorrecto"}"
     }
 }
@@ -1209,136 +1718,6 @@ private fun parseRgb(json: JSONObject): Rgb {
 }
 
 private fun rgbColor(rgb: Rgb) = Color(rgb.red / 255f, rgb.green / 255f, rgb.blue / 255f)
-
-private class MqttController(
-    private val onConnection: (String) -> Unit,
-    private val onEvent: (String) -> Unit,
-    private val onMessage: (String, String) -> Unit
-) {
-    private var client: MqttAsyncClient? = null
-    private val mainHandler = Handler(Looper.getMainLooper())
-
-    fun connect(host: String, port: Int, username: String, password: String) {
-        disconnect()
-        postConnection("Conectando...")
-        val uri = "tcp://$host:$port"
-        try {
-            val mqtt = MqttAsyncClient(uri, "android-banda-${UUID.randomUUID()}", MemoryPersistence())
-            client = mqtt
-            mqtt.setCallback(object : MqttCallbackExtended {
-                override fun connectComplete(reconnect: Boolean, serverURI: String?) {
-                    if (client !== mqtt) return
-                    postConnection("Conectado")
-                    postEvent(if (reconnect) "Conexión MQTT restablecida." else "Conectado a $serverURI")
-                    listOf(COLOR_TOPIC, STATUS_TOPIC, RESULT_TOPIC).forEach { topic ->
-                        try {
-                            mqtt.subscribe(topic, 0, null, object : IMqttActionListener {
-                                override fun onSuccess(asyncActionToken: IMqttToken?) = Unit
-                                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
-                                    if (client === mqtt) postEvent("No se pudo suscribir a $topic: ${exception?.message ?: "error MQTT"}")
-                                }
-                            })
-                        } catch (error: MqttException) {
-                            if (client === mqtt) postEvent("No se pudo suscribir a $topic: ${error.message ?: "error MQTT"}")
-                        }
-                    }
-                }
-
-                override fun connectionLost(cause: Throwable?) {
-                    if (client === mqtt) {
-                        postConnection("Reconectando...")
-                        postEvent("Conexión MQTT perdida; intentando reconectar automáticamente.")
-                    }
-                }
-
-                override fun messageArrived(topic: String?, message: MqttMessage?) {
-                    if (client === mqtt && topic != null && message != null) {
-                        val payload = String(message.payload, Charsets.UTF_8)
-                        mainHandler.post { if (client === mqtt) onMessage(topic, payload) }
-                    }
-                }
-
-                override fun deliveryComplete(token: IMqttDeliveryToken?) = Unit
-            })
-            val options = MqttConnectOptions().apply {
-                userName = username
-                this.password = password.toCharArray()
-                isAutomaticReconnect = true
-                isCleanSession = true
-                connectionTimeout = 10
-                keepAliveInterval = 30
-            }
-            mqtt.connect(options, null, object : IMqttActionListener {
-                override fun onSuccess(asyncActionToken: IMqttToken?) {
-                    if (client === mqtt) postConnection("Conectado")
-                }
-
-                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
-                    if (client === mqtt) {
-                        postConnection("Desconectado")
-                        postEvent("Error al conectar con $uri: ${exception?.message ?: "error MQTT"}")
-                    }
-                }
-            })
-        } catch (error: MqttException) {
-            client = null
-            postConnection("Desconectado")
-            postEvent("Error MQTT: ${error.message ?: "no se pudo iniciar la conexión"}")
-        } catch (error: IllegalArgumentException) {
-            client = null
-            postConnection("Desconectado")
-            postEvent("Dirección del broker inválida: ${error.message ?: host}")
-        }
-    }
-
-    fun publishCommand(command: JSONObject) {
-        val mqtt = client
-        if (mqtt == null || !mqtt.isConnected) {
-            postEvent("No se pudo publicar: MQTT no está conectado.")
-            return
-        }
-        try {
-            mqtt.publish(COMMAND_TOPIC, MqttMessage(command.toString().toByteArray(Charsets.UTF_8)))
-        } catch (error: MqttException) {
-            postEvent("Error al publicar en $COMMAND_TOPIC: ${error.message ?: "error MQTT"}")
-        }
-    }
-
-    fun disconnect() {
-        val mqtt = client ?: return
-        client = null
-        postConnection("Desconectado")
-        try {
-            if (mqtt.isConnected) {
-                mqtt.disconnect(null, object : IMqttActionListener {
-                    override fun onSuccess(asyncActionToken: IMqttToken?) = closeClient(mqtt)
-                    override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
-                        closeClient(mqtt)
-                        postEvent("Error al desconectar MQTT: ${exception?.message ?: "error MQTT"}")
-                    }
-                })
-            } else closeClient(mqtt)
-        } catch (error: MqttException) {
-            postEvent("Error al cerrar MQTT: ${error.message ?: "error MQTT"}")
-        }
-    }
-
-    private fun closeClient(mqtt: MqttAsyncClient) {
-        try {
-            mqtt.close()
-        } catch (error: MqttException) {
-            postEvent("Error al cerrar MQTT: ${error.message ?: "error MQTT"}")
-        }
-    }
-
-    private fun postConnection(value: String) {
-        mainHandler.post { onConnection(value) }
-    }
-
-    private fun postEvent(value: String) {
-        mainHandler.post { onEvent(value) }
-    }
-}
 
 private fun distance(left: Rgb, right: Rgb): Double {
     val red = left.red - right.red

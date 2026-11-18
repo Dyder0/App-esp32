@@ -54,73 +54,11 @@ No agregues un metodo de pago para esta prueba si no lo necesitas.
 PARTE B. REGLAS DE FIRESTORE
 ----------------------------
 
-En Firebase Console abre Firestore Database > Reglas. Reemplaza el contenido
-por estas reglas y pulsa Publicar:
-
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    function signedIn() {
-      return request.auth != null;
-    }
-
-    function isAdmin() {
-      return signedIn()
-        && get(/databases/$(database)/documents/users/$(request.auth.uid))
-             .data.role == "admin";
-    }
-
-    function validCounterUpdate() {
-      let changed = request.resource.data.diff(resource.data).affectedKeys();
-      let acceptedDelta = request.resource.data.accepted - resource.data.accepted;
-      let rejectedDelta = request.resource.data.rejected - resource.data.rejected;
-      return signedIn()
-             && changed.hasOnly(["accepted", "rejected"])
-             && acceptedDelta >= 0
-             && rejectedDelta >= 0
-             && acceptedDelta <= 1
-             && rejectedDelta <= 1
-             && acceptedDelta + rejectedDelta == 1;
-    }
-
-    match /users/{uid} {
-      allow create: if signedIn()
-                    && request.auth.uid == uid
-                    && request.resource.data.role == "usuario";
-      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
-      allow update: if isAdmin()
-                    && request.resource.data.role in ["admin", "usuario"];
-      allow delete: if false;
-    }
-
-    match /inventoryColors/{colorId} {
-      allow read: if signedIn();
-      allow create: if isAdmin();
-      allow update: if isAdmin() || validCounterUpdate();
-      allow delete: if isAdmin();
-    }
-
-    match /results/{resultId} {
-      allow create: if signedIn()
-                    && request.resource.data.uid == request.auth.uid;
-      allow read: if signedIn();
-      allow update, delete: if false;
-    }
-
-    match /stoppages/{stopId} {
-      allow create: if signedIn()
-                    && request.resource.data.uid == request.auth.uid
-                    && request.resource.data.reason is string
-                    && request.resource.data.reason.size() > 0;
-      allow read: if isAdmin();
-      allow update, delete: if false;
-    }
-  }
-}
-
-NOTA: En la regla de inventoryColors, una cuenta normal solo puede aumentar
-exactamente uno de los contadores por resultado y no puede cambiar el permiso
-ni el RGB. Nunca uses "allow read, write: if true".
+En Firebase Console abre Firestore Database > Reglas y publica el contenido del
+archivo `firestore.rules` incluido con el proyecto. Las reglas permiten a todos
+los roles leer el inventario; las lecturas quedan asociadas al UID y los
+resultados solo son visibles para mantenimiento, administradores y su dueño.
+Las cuentas nuevas reciben el rol operador. No uses "allow read, write: if true".
 
 
 PARTE C. CREAR ADMINISTRADOR Y CUENTAS DE USUARIO
@@ -133,7 +71,7 @@ Crear el primer administrador:
 
 1. En la app, escribe el correo y una contrasena de al menos 6 caracteres.
 2. Pulsa "Crear cuenta de usuario". Al principio todas las cuentas nuevas son
-   usuarios normales.
+   operadores.
 3. En Firebase Console abre Authentication > Users y copia el UID de tu cuenta.
 4. Abre Firestore Database > Datos. Crea la coleccion users si aun no existe.
 5. Crea un documento cuyo ID sea exactamente el UID copiado.
@@ -142,7 +80,7 @@ Crear el primer administrador:
        email   (string) = tu correo
        role    (string) = admin
 
-   La app ya puede haber creado ese documento con role = usuario; en ese caso,
+   La app ya puede haber creado ese documento con role = operador; en ese caso,
    editalo y cambia solo el valor de role a admin.
 7. Cierra sesion y vuelve a entrar en la app. Debes ver el texto ADMINISTRADOR.
 
@@ -156,12 +94,11 @@ Crear trabajadores:
 1. La persona abre la app y pulsa "Crear cuenta de usuario".
 2. El administrador entra en su app y confirma que esa cuenta aparezca en
    "Cuentas y roles".
-3. Si corresponde, pulsa "Hacer admin"; normalmente se deja como usuario.
+3. Asigna Operador, Mantenimiento o Administrador según las tareas permitidas.
 
-ADMIN puede administrar colores, dar de alta colores y cambiar los roles.
-USUARIO puede consultar el inventario y operar la banda. Al detener, el usuario
-debe escribir un motivo; el administrador no necesita ingresarlo y la app
-registra la parada automáticamente con su cuenta y la hora en Firestore.
+Operador solo ve el inventario. Mantenimiento también puede detener la banda y
+cambiar su velocidad. Administrador puede iniciar y detener la banda, gestionar
+colores y cambiar roles.
 
 
 PARTE D. INSTALAR Y CONECTAR MOSQUITTO EN LA SALA
@@ -200,8 +137,9 @@ al mismo router Wi-Fi que el telefono y el ESP32.
    192.168.1.25. No uses 127.0.0.1: esa direccion solo apunta al mismo equipo.
 6. Deja abierta la ventana del broker. No inicies una segunda instancia de
    Mosquitto si ya esta ejecutandose.
-7. Si Windows Firewall pregunta, permite los puertos TCP 1883 y 9001 solo en
-   el perfil Privado. No abras el perfil Publico.
+7. Si Windows Firewall pregunta, permite TCP 1883 en el perfil Privado. Añade
+   TCP 8883 solo si configuraste TLS. WebSockets 9001 es opcional para el
+   simulador HTML; no lo usa la app ni el ESP32.
 8. Comprueba desde otro computador de la misma red:
 
        Test-NetConnection 192.168.1.25 -Port 1883
@@ -209,12 +147,27 @@ al mismo router Wi-Fi que el telefono y el ESP32.
    Cambia 192.168.1.25 por la IPv4 que viste en ipconfig. Busca
    "TcpTestSucceeded : True". Si dice False, revisa Mosquitto, firewall y que
    los equipos esten en la misma red.
-9. En la app, entra con Firebase, escribe la IPv4 y puerto 1883, e ingresa el
-   mismo usuario y contrasena MQTT. La app guarda el usuario, pero no guarda la
-   contrasena. El indicador debe decir Conectado.
+9. En la app, entra con Firebase y abre Configuración. Escribe la IP local del
+   broker, el puerto, usuario y clave MQTT. La clave y el usuario se cifran con
+   Android Keystore. Usa 1883 por defecto o activa TLS para usar 8883.
 10. El ESP32 tambien debe conectarse con ese usuario y contrasena al broker y
     publicar/suscribirse en los topics acordados. El telefono no conecta
     directamente al ESP32.
+    El firmware `clasificador_color_esp32.ino` esta en la carpeta principal del
+    proyecto. En Arduino IDE instala ESP32Servo, PubSubClient, ArduinoJson 6
+    y hd44780 (I2Cexp).
+    Abre el Monitor Serie a 115200 baudios y configura por primera vez el Wi-Fi,
+    la IP del broker y las credenciales MQTT cuando el ESP32 las solicite.
+    Ingresa en el ESP32 los mismos datos del broker que en la app. Para cambiar
+    la red más adelante, envía CONFIGURAR por serie. Con TLS, pega el PEM de la
+    CA confiable y termina con FIN_CA. El LCD se configura como
+    16x2, direccion I2C 0x27 y pines SDA 21/SCL 22; modifica las constantes
+    LCD_DIRECCION, LCD_SDA y LCD_SCL si tu modulo o placa usan otros valores.
+    La pantalla alterna cada 2,5 s entre estado/conectividad, contadores y
+    velocidad/servo. Si no se detecta, el firmware lo informa por serie y
+    sigue funcionando sin LCD.
+    Si activas TLS, el broker también debe escuchar en 8883 con un certificado
+    emitido por esa CA. La app valida el nombre/IP del certificado.
 11. Si la escuela tiene una red de invitados, puede aislar a los equipos entre
    si. Pide una red de laboratorio que permita comunicacion entre clientes.
    Para la clase, prueba tambien con un punto de acceso Wi-Fi propio.
@@ -226,14 +179,54 @@ Topics usados:
   ESP32 publica  banda/resultado
   App publica    banda/comandos
 
-La app se conecta a Mosquitto por TCP al puerto 1883. Firebase usa internet y
-es independiente del broker; no reemplaza MQTT.
+La red Wi-Fi local y el acceso a Internet son cosas distintas: MQTT puede
+funcionar sin Internet si el teléfono, el ESP32 y el broker siguen conectados
+al mismo punto de acceso. Firebase necesita Internet; WorkManager sincroniza
+lecturas, resultados e inventario desde la cola Room al recuperar conectividad.
+La app reintenta MQTT tras 2, 4, 8, 16 y hasta 30 segundos y vuelve a suscribirse.
+Los controles quedan deshabilitados sin broker. El ESP32 conserva una lectura
+pendiente en NVS, pausa la banda hasta recibir aceptar/expulsar para ese ID y
+republica la lectura si pierde MQTT. El resultado se conserva en NVS y se vuelve
+a publicar cada cinco segundos hasta que la app confirma `resultado_ack`, que
+envia solo despues de guardar el resultado localmente. La app deduplica por ID,
+por lo que tambien puede confirmar de nuevo un resultado ya guardado. Solo se
+procesa una caja pendiente a la vez.
 
-El HTML es un ESP32 virtual para probar la app desde el celular. El HTML se
+Si el rechazo automático detecta una caja mientras se pierde Wi-Fi/MQTT, la app
+deja visible la decisión en cola y vuelve a intentarla al recuperar la conexión.
+La decisión vence a los 10 segundos para no aplicar un rechazo a una caja distinta.
+La confirmación de que el ESP32 ejecutó la orden se muestra únicamente al recibir
+`banda/resultado`; la confirmación del broker por sí sola no confirma el actuador.
+
+Para reducir consumo, el firmware habilita ahorro del módem Wi-Fi, libera las
+bobinas del motor cuando no mueve la banda, desconecta el servo tras el
+movimiento y publica el estado cada segundo. La pantalla Energía muestra el
+ahorro automático del teléfono, la batería, el keep-alive y el tráfico MQTT.
+El modo ahorro MQTT usa keep-alive de 120 s, refresco visual más lento y QoS 0
+para banda/estado. Estas medidas no equivalen
+a una medición de consumo: registra corriente y tensión reales para evaluar el
+ahorro. El ESP32 no puede seguir operando si pierde alimentación.
+
+La comunicación de operación es Wi-Fi/MQTT. El Monitor Serie USB solo se usa
+para configurar la red del ESP32; no se usa Bluetooth. El informe
+INFORME_RUBRICA_COMUNICACION_IOT.md resume la evidencia,
+los límites de seguridad y el plan de pruebas.
+
+El firmware publica cada lectura como JSON con `id`, `r`, `g` y `b`; recibe
+decisiones `aceptar`/`expulsar` con ese mismo `id`, ademas de `iniciar`,
+`detener` y `velocidad`. Pausa la banda mientras espera la decision para evitar
+perder la lectura. El firmware incluido solo distingue rojo, verde y azul y
+manda RGB de referencia, no una medicion RGB calibrada; por eso, el alta de
+colores personalizados requiere calibrar y ampliar la lectura del sensor.
+
+La app se conecta al broker MQTT local por TCP al puerto 1883 o por TLS al 8883.
+Firebase usa Internet y es independiente del broker; no reemplaza MQTT.
+
+El HTML es un simulador virtual opcional; no es el firmware del ESP32. El HTML se
 conecta a localhost:9001 porque corre en el mismo computador que Mosquitto; el
 celular usa la IPv4 de ese computador y puerto 1883. Ambos piden usuario y
-contrasena MQTT. El transporte MQTT de esta configuracion no usa TLS: la
-contrasena viaja por la red local sin cifrado. No uses una red publica, no
+contrasena MQTT. Si MQTT no usa TLS, la clave viaja sin cifrar dentro de la red
+local. No uses una red pública, no
 reenvies los puertos a internet y no uses una contrasena importante de otras
 cuentas. No conectes el ESP32 real y el simulador a la vez: ambos publican en
 banda/sensor/color y podrian duplicar o mezclar lecturas.
@@ -248,10 +241,9 @@ Operar:
 2. Conecta el telefono al Wi-Fi de laboratorio.
 3. Conecta la app al broker usando la IPv4 del computador que ejecuta Mosquitto
    y el puerto 1883.
-4. La pantalla principal muestra la animacion sencilla de la banda, el estado
-   y la velocidad reportada. Inicia sesion con Firebase y pulsa "Configurar"
-   en la tarjeta MQTT para abrir broker, velocidad y cuentas. "Inventario" abre
-   los colores y las ultimas cajas.
+4. Administrador y Mantenimiento ven Banda, Inventario, Energía, Historial y
+   Ajustes. Operador ve solo Inventario. Banda muestra el estado, velocidad y
+   controles permitidos para ese rol. Configuración pide broker y credenciales.
 5. Una lectura RGB se compara con el inventario usando distancia euclidiana
    con tolerancia 90. Si se parece a un color bloqueado se expulsa; si se
    parece a uno permitido se acepta. En Configuracion, "Solo aceptar colores
@@ -261,28 +253,27 @@ Operar:
    Este ajuste se guarda en cada telefono, asi que configuralo igual en cada
    dispositivo desde el que se vaya a operar la banda.
 
-Para mostrar la velocidad, el JSON de banda/estado puede incluir "velocidad"
-y, opcionalmente, "unidadVelocidad", por ejemplo:
-  {"banda":"en marcha","sensor":"listo","servo":"reposo",
-   "aceptadas":0,"expulsadas":0,"velocidad":80,"unidadVelocidad":"%"}
-Sin ese dato la app muestra "Sin datos". La animacion es solo visual y no mide
-la velocidad real del motor.
+El ESP32 debe publicar cada segundo un estado JSON con los campos obligatorios:
+  {"banda":"En marcha","sensor":"Conectado","servo":90,
+   "aceptadas":0,"expulsadas":0,"velocidad":60.0,"unidadVelocidad":"pasos/s"}
+`banda` acepta `En marcha`, `Detenida` o `Esperando decision`; `servo` y los
+contadores son enteros y la velocidad debe estar entre 10 y 100 pasos/s. Los
+mensajes inválidos se descartan y quedan registrados en el evento visible.
 
-Para ajustar la velocidad desde la app, abre la tarjeta MQTT, mueve el control
-"Velocidad de la banda" entre 10% y 100% y pulsa "Aplicar velocidad". Publica:
+Para ajustar la velocidad desde la app, abre Ajustes, mueve el control
+"Velocidad de la banda" entre 10 y 100 pasos/s y pulsa "Aplicar velocidad". Publica:
   {"accion":"velocidad","valor":60}
-El simulador entiende ese comando. El firmware del ESP32 fisico tambien debe
-suscribirse a banda/comandos y programar la velocidad del motor usando ese
-porcentaje; si no reconoce la accion, no cambiara la velocidad del hardware.
+El firmware del ESP32 suscribe `banda/comandos` con QoS 1 y convierte ese valor
+en pasos/s. El simulador HTML es opcional y no forma parte del enlace Android.
 
 Detener por operacion o emergencia:
 
 1. Pulsa "Detener banda".
-2. El usuario escribe un motivo obligatorio; si es administrador, la parada
-   se registra automaticamente sin pedirlo.
+2. Mantenimiento escribe un motivo obligatorio; el administrador no necesita
+   ingresarlo.
 3. La app publica {"accion":"detener"} y registra en Firestore quien y por que
    hizo la parada.
-4. Pulsa "Iniciar banda" para reanudar.
+4. Solo Administrador puede iniciar la banda desde la app.
 
 Dar de alta una muestra (solo administrador):
 
@@ -313,8 +304,8 @@ con funciones Kotlin.
 
 MainActivity.kt
   Es la entrada de la app. ConveyorApp guarda el estado visible, muestra login
-  o pantalla de operacion y conecta las acciones de la pantalla con Firebase y
-  MQTT.   ConveyorScreen contiene las pantallas principal, inventario y configuracion.
+  o las pantallas Banda, Inventario, Configuración, Energía e Historial, y
+  conecta las acciones con Firebase y MQTT.
   Las funciones receiveColor, receiveStatus y receiveResult interpretan
   mensajes JSON de MQTT.
 
@@ -337,6 +328,18 @@ FirebaseRepository.kt
   registrar paradas. La pantalla no necesita construir consultas Firestore
   por su cuenta.
 
+MqttController.kt y MqttJsonValidator.kt
+  Paho mantiene la conexión MQTT local, vuelve a suscribirse al reconectar y
+  valida los mensajes JSON antes de que lleguen a la pantalla.
+
+BrokerConfig.kt
+  Guarda host y puerto del broker y cifra usuario y clave mediante Android
+  Keystore. El host se limita a direcciones locales.
+
+LocalDataStore.kt y FirebaseSyncWorker.kt
+  Room conserva lecturas, resultados, inventario, eventos de conexión y cola de
+  sincronización. WorkManager vacía esa cola cuando la red vuelve.
+
 ColorRulesTest.kt
   Prueba colores cercanos permitidos y bloqueados, la regla de colores nuevos
   y el limite de distancia.
@@ -352,7 +355,8 @@ mosquitto-clase.conf
   guardar la contrasena en el codigo fuente.
 
 AndroidManifest.xml
-  Declara el permiso de internet que necesitan Firebase y MQTT.
+  Declara INTERNET y ACCESS_NETWORK_STATE. No se usa Bluetooth, servicio en
+  primer plano ni permiso de notificaciones.
 
 Para localizar una funcion en Android Studio, usa Ctrl+F y escribe su nombre.
 Para eliminar este tutorial, basta con borrar este archivo TXT; la app no lo

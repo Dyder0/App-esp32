@@ -1,76 +1,67 @@
 # App-esp32
 
-Aplicacion Android para supervisar una banda transportadora. La app esta
-desarrollada en Kotlin con Jetpack Compose; se comunica con Firebase para
-usuarios e inventario, y con un broker MQTT para intercambiar lecturas y
-comandos con un ESP32 o con el simulador incluido.
+Aplicación Android para una banda clasificadora. Está desarrollada en Kotlin y
+Jetpack Compose; usa Firebase para cuentas, inventario y sincronización, y Paho
+MQTT para comunicarse con un broker de la red Wi-Fi local.
 
-> La pantalla Android no esta hecha en HTML. El archivo HTML de este repositorio
-> es un simulador independiente para probar la comunicacion MQTT sin el ESP32.
+## Arquitectura y pantallas
 
-## Contenido del proyecto
+- `MainActivity.kt`: inicio de sesión y navegación Compose. Presenta Banda,
+  Inventario, Configuración, Energía e Historial de conexión.
+- `MqttController.kt`: conexión MQTT por Wi-Fi, reintentos, suscripciones,
+  publicación de comandos, validación de decisiones y estadísticas.
+- `MqttJsonValidator.kt`: valida los campos, tipos y rangos del protocolo.
+- `BrokerConfig.kt`: configuración del broker; usuario y clave se cifran con
+  Android Keystore. No se incluyen valores de conexión en el código.
+- `LocalDataStore.kt` y `FirebaseSyncWorker.kt`: Room, cola local y sincronización
+  con Firestore mediante WorkManager cuando hay red.
+- `FirebaseRepository.kt`: autenticación, perfiles, roles e inventario.
+- `clasificador_color_esp32.ino`: firmware ESP32 con PubSubClient.
 
-- [`app/src/main/java/com/example/iot/MainActivity.kt`](app/src/main/java/com/example/iot/MainActivity.kt):
-  pantallas, estado de la app, comunicacion MQTT y decisiones de color.
-- [`app/src/main/java/com/example/iot/FirebaseRepository.kt`](app/src/main/java/com/example/iot/FirebaseRepository.kt):
-  autenticacion y operaciones de Firestore.
-- [`app/src/main/res/`](app/src/main/res/): iconos, temas y otros recursos Android.
-- [`app/src/test/java/com/example/iot/ColorRulesTest.kt`](app/src/test/java/com/example/iot/ColorRulesTest.kt):
-  pruebas de las reglas de clasificacion por color.
-- [`app/src/main/AndroidManifest.xml`](app/src/main/AndroidManifest.xml):
-  configuracion Android y permiso de Internet.
-- [`app/build.gradle.kts`](app/build.gradle.kts) y
-  [`gradle/libs.versions.toml`](gradle/libs.versions.toml): plugins y dependencias.
-- [`simulador_banda_3d.html`](simulador_banda_3d.html): simulador web de la banda.
-- [`GUIA_PUESTA_EN_MARCHA.txt`](GUIA_PUESTA_EN_MARCHA.txt): pasos para configurar
-  Firebase, Firestore y MQTT.
+## Configuración
 
-## Probar la app
+1. Abre la carpeta raíz en Android Studio y configura Firebase Authentication y
+   Firestore. Publica las reglas de `firestore.rules` y coloca tu
+   `google-services.json` en `app/google-services.json`.
+2. Inicia un broker MQTT en la misma red Wi-Fi del teléfono y el ESP32. El puerto
+   predeterminado es `1883`; activa TLS en Configuración para usar `8883`.
+3. En la app inicia sesión y abre Configuración. Ingresa IP local, puerto, usuario
+   y clave del broker. El estado debe pasar a Conectado.
+4. En Arduino IDE instala ESP32Servo, PubSubClient, ArduinoJson 6 y
+   hd44780. Carga el sketch en la placa y abre el Monitor Serie a
+   115200 baudios con fin de línea. En el primer arranque ingresa SSID, clave
+   Wi-Fi, host, puerto y credenciales MQTT. Si activas TLS, ingresa el PEM de la
+   CA confiable y termina con `FIN_CA`. La configuración se conserva en NVS.
+5. Para cambiar los datos del ESP32 envía `CONFIGURAR` por el Monitor Serie.
+   Configura en el ESP32 los mismos datos MQTT que en la pantalla Android.
 
-1. Abre la carpeta raiz del proyecto en Android Studio y espera a que Gradle
-   termine la sincronizacion.
-2. Descarga desde Firebase el archivo de configuracion Android
-   `google-services.json` para el paquete `com.example.iot` y colocalo en
-   `app/google-services.json`. Ese archivo esta excluido de Git; cada persona
-   que clone el proyecto debe obtener su propia configuracion.
-3. Habilita Firebase Authentication con correo y contrasena y configura
-   Firestore. Sigue la guia para publicar reglas seguras y asignar el rol de
-   administrador.
-4. Inicia un broker MQTT accesible por el telefono y, si usas el simulador,
-   habilita MQTT TCP en el puerto `1883` y WebSockets en el `9001`.
-5. Ejecuta la app desde Android Studio e inicia sesion. En la configuracion MQTT
-   usa la IP local del broker y el puerto `1883`.
-6. Para simular el ESP32, abre `simulador_banda_3d.html` en un navegador que
-   tenga Internet, conecta al broker por WebSockets (`9001`) e ingresa las
-   credenciales MQTT que configuraste. Si el navegador y Mosquitto estan en el
-   mismo computador, deja `localhost`; el telefono debe usar la IP de ese
-   computador, no `localhost`.
+El LCD I2C 16x2 alterna cada 2,5 segundos entre estado/conectividad,
+contadores de cajas y velocidad/servo. Si no se detecta, el firmware informa
+el error por Serial y continúa funcionando sin LCD.
 
-El simulador carga MQTT.js desde jsDelivr y necesita Internet para esa
-biblioteca. El ESP32 real requiere su propio firmware; ese firmware no forma
-parte de este repositorio. Usa el simulador o el ESP32, no ambos a la vez,
-porque los dos publicarian lecturas en los mismos topics.
+El teléfono y el ESP32 deben compartir la red del broker; una red de invitados
+puede bloquear el tráfico entre dispositivos. El ESP32 y la app intercambian los
+tópicos `banda/sensor/color`, `banda/estado`, `banda/resultado` y
+`banda/comandos`. La banda espera una decisión `aceptar` o `expulsar` para el ID
+pendiente. El estado se publica cada segundo y la velocidad se expresa en
+pasos/s entre 10 y 100. El ESP32 conserva los resultados en NVS y los reenvía
+cada cinco segundos hasta recibir `resultado_ack` de la app después de su
+persistencia local.
 
-MQTT sin TLS no cifra las credenciales. Mantén el broker en una red local
-confiable; no expongas sus puertos a Internet ni publiques el archivo de
-contrasenas de Mosquitto o credenciales.
+Firebase requiere Internet para iniciar sesión y sincronizar. Si Firebase no
+está disponible, lecturas, resultados e inventario permanecen en Room y se
+sincronizan al volver la conectividad. MQTT sigue siendo local e independiente.
+Para TLS, Android debe confiar en el certificado del broker y el ESP32 debe
+recibir por serie el certificado CA correspondiente.
 
-## Pruebas
+## Compilar
 
-En Windows, desde la raiz del proyecto:
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+Para revisar las pruebas existentes:
 
 ```powershell
 .\gradlew.bat testDebugUnitTest
 ```
-
-Para compilar la app:
-
-```powershell
-.\gradlew.bat assembleDebug
-```
-
-No es necesario reducir el codigo para publicarlo: cada componente tiene una
-responsabilidad distinta. Para preparar una explicacion oral, empieza por
-`MainActivity.kt`, sigue con `FirebaseRepository.kt` y termina con el simulador
-HTML y las pruebas. La explicacion detallada para uso local esta en
-`EXPLICACION_CODIGO_LOCAL.txt`; ese archivo esta ignorado por Git y no se sube.

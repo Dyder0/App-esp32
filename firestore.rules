@@ -1,0 +1,96 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return signedIn() && role() == "admin";
+    }
+
+    function isMaintenance() {
+      return signedIn() && role() == "mantenimiento";
+    }
+
+    function ownsIncomingRecord() {
+      return signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+
+    function validRgb(data) {
+      return data.red is int && data.red >= 0 && data.red <= 255
+        && data.green is int && data.green >= 0 && data.green <= 255
+        && data.blue is int && data.blue >= 0 && data.blue <= 255;
+    }
+
+    function validCounterUpdate() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      let acceptedDelta = request.resource.data.accepted - resource.data.accepted;
+      let rejectedDelta = request.resource.data.rejected - resource.data.rejected;
+      return signedIn()
+        && changed.hasOnly(["accepted", "rejected"])
+        && acceptedDelta >= 0 && rejectedDelta >= 0
+        && acceptedDelta <= 1 && rejectedDelta <= 1
+        && acceptedDelta + rejectedDelta == 1;
+    }
+
+    match /users/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(["email", "role"])
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == "operador";
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["role"])
+        && request.resource.data.role in ["admin", "operador", "mantenimiento"];
+      allow delete: if false;
+    }
+
+    match /inventoryColors/{colorId} {
+      allow read: if signedIn();
+      allow create: if isAdmin() && validRgb(request.resource.data);
+      allow update: if isAdmin() || validCounterUpdate();
+      allow delete: if isAdmin();
+    }
+
+    match /readings/{readingId} {
+      allow create, update: if ownsIncomingRecord()
+        && (resource == null || resource.data.uid == request.auth.uid)
+        && request.resource.data.keys().hasAll([
+          "uid", "boxId", "red", "green", "blue", "colorName", "deviceTimestamp", "receivedAt"
+        ])
+        && validRgb(request.resource.data);
+      allow get, list: if isAdmin() || isMaintenance();
+      allow delete: if false;
+    }
+
+    match /results/{resultId} {
+      allow create: if ownsIncomingRecord()
+        && request.resource.data.keys().hasAll([
+          "uid", "boxId", "red", "green", "blue", "result", "createdAt"
+        ])
+        && validRgb(request.resource.data)
+        && request.resource.data.result in ["aceptada", "expulsada"];
+      allow get: if signedIn() && (resource == null
+        || resource.data.uid == request.auth.uid || isAdmin() || isMaintenance());
+      allow list: if isAdmin() || isMaintenance();
+      allow update, delete: if false;
+    }
+
+    match /stoppages/{stopId} {
+      allow create: if (isAdmin() || isMaintenance())
+        && ownsIncomingRecord()
+        && request.resource.data.keys().hasOnly(["uid", "role", "reason", "createdAt"])
+        && request.resource.data.role in ["admin", "mantenimiento"]
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0;
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}

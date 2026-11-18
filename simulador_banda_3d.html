@@ -79,7 +79,7 @@
 
   <div class="card">
     <h2>Simulación</h2>
-    <label>Velocidad de la banda</label><input type="range" id="vel" min="50" max="170" value="95">
+    <label>Velocidad de la banda (pasos/s)</label><input type="range" id="vel" min="50" max="170" value="95">
     <label>Probabilidad de lectura fallida: <span id="pfV">20</span>%</label><input type="range" id="pf" min="0" max="60" value="20">
     <label>Ruido del sensor (±): <span id="ruV">5</span></label><input type="range" id="ru" min="0" max="20" value="5">
     <div class="row" style="margin-top:10px">
@@ -165,7 +165,7 @@ function onMsg(t,txt){
     if(!Number.isFinite(percent)){log('Comando de velocidad inválido','err');return}
     const bounded=Math.max(10,Math.min(100,percent));
     $('vel').value=50+(bounded-10)/90*120;
-    log('Velocidad ajustada a '+Math.round(bounded)+'%','ok');
+    log('Velocidad ajustada a '+Math.round(bounded)+' pasos/s','ok');
     return
   }
   if(/expuls|rechaz|bloque|reject|block|eject/.test(w))return decidir(id,'expulsar');
@@ -190,7 +190,9 @@ function clasificar(m){
 }
 function encolar(name,c){if(cola.length<20)cola.push({name,c})}
 function spawn(o){boxes.push({id:nextId++,name:o.name,c:o.c,x:20,y:(W-BD)/2,z:H+90,vz:0,state:'spawn',decision:null,scanned:false,passed:false,t:0,attempt:0,alpha:1})}
-const beltMoves=()=>st.running&&st.servo.phase==='idle'&&!boxes.some(b=>b.state==='scan'||b.state==='wait');
+function nombreProtocolo(rgb){return rgb[0]>=rgb[1]&&rgb[0]>=rgb[2]?'ROJO':rgb[1]>=rgb[2]?'VERDE':'AZUL'}
+const beltMoves=()=>st.running&&st.servo.phase==='idle'&&!boxes.some(b=>
+  b.state==='scan'||b.state==='wait'||(b.scanned&&!b.decision&&!b.passed));
 
 function atServo(b){
   if(b.decision==='aceptar'){b.passed=true}
@@ -207,7 +209,7 @@ function finishScan(b){
   const m=b.c.map(v=>clamp(v+gauss()*sigma()));
   b.reading=m;b.scanned=true;b.state='ride';
   st.reading={rgb:m,bad:false};st.readingT=2.2;
-  pub('sensor/color',{id:b.id,r:m[0],g:m[1],b:m[2],ts:Date.now()});
+  pub('sensor/color',{id:b.id,r:m[0],g:m[1],b:m[2],nombre:nombreProtocolo(m),ts:Date.now()});
   if(!modoApp()){
     b.decision=clasificar(m);
     log('Caja #'+b.id+' leída RGB('+m.join(',')+') → '+b.decision+' (lista local)',b.decision==='expulsar'?'warn':'ok');
@@ -233,16 +235,15 @@ function update(dt){
       case 'scan':b.t+=dt;if(b.t>=1.1)finishScan(b);break;
       case 'wait':b.t+=dt;
         if(b.decision){b.state='ride';atServo(b)}
-        else if(b.t>4){b.decision='aceptar';log('Sin respuesta de la app: la caja #'+b.id+' se deja pasar (fail-safe)','warn')}
         break;
       case 'fall':b.vz-=900*dt;b.z+=b.vz*dt;
         if(b.z<=4){b.z=4;b.state='binned';b.landed=now;st.ex++;
-          pub('resultado',{id:b.id,r:b.reading[0],g:b.reading[1],b:b.reading[2],resultado:'expulsada'});
+          pub('resultado',{id:b.id,r:b.reading[0],g:b.reading[1],b:b.reading[2],resultado:'expulsada',ts:Date.now()});
           log('Caja #'+b.id+' expulsada por el servo','warn')}
         break;
       case 'end':b.vz-=900*dt;b.z+=b.vz*dt;b.x+=120*dt;
         if(b.z<=4){b.z=4;b.state='binned';b.landed=now;st.ac++;
-          pub('resultado',{id:b.id,r:b.reading[0],g:b.reading[1],b:b.reading[2],resultado:'aceptada'});
+          pub('resultado',{id:b.id,r:b.reading[0],g:b.reading[1],b:b.reading[2],resultado:'aceptada',ts:Date.now()});
           log('Caja #'+b.id+' aceptada','ok')}
         break;
       case 'binned':{const a=now-b.landed;b.alpha=a>2?Math.max(0,1-(a-2)):1}break;
@@ -263,11 +264,13 @@ function update(dt){
   }
   /* estado hacia la app */
   st.hb+=dt;
-  const obj={banda:st.running?(mv?'en_marcha':'pausa'):'detenida',sensor:boxes.some(b=>b.state==='scan')?'midiendo':'libre',
-             servo:s.phase==='idle'?'reposo':'empujando',aceptadas:st.ac,expulsadas:st.ex,
-             velocidad:Math.round(10+(speed()-50)/120*90),unidadVelocidad:'%'};
+  const esperando=boxes.some(b=>b.state==='wait'||(b.scanned&&!b.decision&&!b.passed));
+  const obj={banda:esperando?'Esperando decision':(st.running?'En marcha':'Detenida'),
+             sensor:boxes.some(b=>b.state==='scan')?'midiendo':'libre',
+             servo:s.phase==='idle'?90:150,aceptadas:st.ac,expulsadas:st.ex,
+             velocidad:Math.round(10+(speed()-50)/120*90),unidadVelocidad:'pasos/s'};
   const key=JSON.stringify(obj);
-  if(connected&&(key!==st.lastKey||st.hb>3)){st.lastKey=key;st.hb=0;pub('estado',obj)}
+  if(connected&&(key!==st.lastKey||st.hb>=1)){st.lastKey=key;st.hb=0;pub('estado',obj)}
 }
 
 /* ---------- dibujo ---------- */
