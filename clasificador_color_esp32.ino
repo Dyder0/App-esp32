@@ -1,12 +1,4 @@
-/*
-  Clasificador de color ESP32 compatible con la app Android App-esp32.
-  Placa: ESP32 Dev Module
-  Bibliotecas: ESP32Servo, PubSubClient, ArduinoJson 6, hd44780
 
-  La app se conecta a un broker MQTT local. El ESP32 y el teléfono deben
-  estar en la misma red Wi-Fi y usar el mismo broker y credenciales.
-  La banda se pausa mientras la app decide cada caja para no perder lecturas.
-*/
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
