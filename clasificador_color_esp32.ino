@@ -1,12 +1,3 @@
-/*
-  Clasificador de color ESP32 compatible con la app Android App-esp32.
-  Placa: ESP32 Dev Module
-  Bibliotecas: ESP32Servo, PubSubClient, ArduinoJson 6, hd44780
-
-  La app se conecta a un broker MQTT local. El ESP32 y el teléfono deben
-  estar en la misma red Wi-Fi y usar el mismo broker y credenciales.
-  La banda se pausa mientras la app decide cada caja para no perder lecturas.
-*/
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
@@ -76,6 +67,9 @@ int pasoIdx = 0;
 bool servoAttached = false;
 bool servoReturning = false;
 int servoAngle = 90;
+bool lcdDisponible = false;
+uint32_t tPaginaLcd = 0;
+uint8_t paginaLcd = 0;
 
 String leerLineaSerial(const String& mensaje) {
   Serial.println(mensaje);
@@ -178,6 +172,7 @@ void cargarConfiguracionRed() {
 }
 
 void escribirLineaLCD(uint8_t fila, const char* texto) {
+  if (!lcdDisponible) return;
   char linea[17];
   memset(linea, ' ', 16);
   linea[16] = '\0';
@@ -193,20 +188,35 @@ void escribirLineaLCD(uint8_t fila, const char* texto) {
 }
 
 void actualizarLCD() {
+  if (!lcdDisponible) return;
+  uint32_t ahora = millis();
+  if (ahora - tPaginaLcd >= 2500) {
+    tPaginaLcd = ahora;
+    paginaLcd = (paginaLcd + 1) % 3;
+  }
+
   char linea1[17];
   char linea2[17];
-  if (lecturaPendiente) {
-    snprintf(linea1, sizeof(linea1), "Caja: esperando");
-  } else if (resultadoPendiente) {
-    snprintf(linea1, sizeof(linea1), "Res. pendiente");
-  } else if (bandaOn) {
-    snprintf(linea1, sizeof(linea1), "Banda: en marcha");
+  if (paginaLcd == 0) {
+    if (lecturaPendiente) {
+      snprintf(linea1, sizeof(linea1), "Caja: esperando");
+    } else if (resultadoPendiente) {
+      snprintf(linea1, sizeof(linea1), "Res. pendiente");
+    } else if (bandaOn) {
+      snprintf(linea1, sizeof(linea1), "Banda: en marcha");
+    } else {
+      snprintf(linea1, sizeof(linea1), "Banda: detenida");
+    }
+    snprintf(linea2, sizeof(linea2), "WiFi %s MQTT %s",
+             WiFi.status() == WL_CONNECTED ? "OK" : "--",
+             mqtt.connected() ? "OK" : "--");
+  } else if (paginaLcd == 1) {
+    snprintf(linea1, sizeof(linea1), "Aceptadas: %lu", (unsigned long)aceptadas);
+    snprintf(linea2, sizeof(linea2), "Expulsadas: %lu", (unsigned long)expulsadas);
   } else {
-    snprintf(linea1, sizeof(linea1), "Banda: detenida");
+    snprintf(linea1, sizeof(linea1), "Velocidad: %lu", (unsigned long)(1000 / intervaloPasoMs));
+    snprintf(linea2, sizeof(linea2), "Servo angulo:%d", servoAngle);
   }
-  snprintf(linea2, sizeof(linea2), "WiFi %s MQTT %s",
-           WiFi.status() == WL_CONNECTED ? "OK" : "--",
-           mqtt.connected() ? "OK" : "--");
   escribirLineaLCD(0, linea1);
   escribirLineaLCD(1, linea2);
 }
@@ -281,12 +291,6 @@ bool publicarResultado(bool aceptada) {
   return mqtt.publish(TOPIC_RESULTADO, mensaje, largo);
 }
 
-void completarPublicacionResultado() {
-  resultadoPendiente = false;
-  prefs.putBool("resPendiente", false);
-  inicioEnfriamiento = millis();
-}
-
 void completarDecision(bool aceptada) {
   if (!lecturaPendiente) return;
 
@@ -317,7 +321,7 @@ void completarDecision(bool aceptada) {
 
   lecturaPendiente = false;
   prefs.putBool("pendiente", false);
-  if (publicarResultado(resultadoAceptado)) completarPublicacionResultado();
+  publicarResultado(resultadoAceptado);
   tResultadoPendiente = millis();
   publicarEstado();
 }
@@ -346,6 +350,21 @@ void procesarComando(char* payload, unsigned int largo) {
       return;
     }
     intervaloPasoMs = max(1, 1000 / pasosPorSegundo);
+  } else if (strcmp(accion, "resultado_ack") == 0) {
+    if (!doc["id"].is<uint32_t>()) {
+      Serial.println("ACK de resultado invalido: se requiere un ID entero.");
+      return;
+    }
+    uint32_t id = doc["id"].as<uint32_t>();
+    if (!resultadoPendiente || id != idResultadoPendiente) {
+      Serial.printf("ACK ignorado para resultado %lu; no coincide con el pendiente.\n",
+                    (unsigned long)id);
+      return;
+    }
+    resultadoPendiente = false;
+    prefs.putBool("resPendiente", false);
+    inicioEnfriamiento = millis();
+    Serial.printf("Resultado de caja %lu confirmado por la app.\n", (unsigned long)id);
   } else if (strcmp(accion, "aceptar") == 0 || strcmp(accion, "expulsar") == 0) {
     uint32_t id = doc["id"] | 0UL;
     if (!lecturaPendiente || id != idPendiente) {
@@ -387,7 +406,7 @@ void conectarMqtt() {
     mqtt.subscribe(TOPIC_COMANDOS, 1);
     publicarEstado();
     if (resultadoPendiente) {
-      if (publicarResultado(resultadoAceptado)) completarPublicacionResultado();
+      publicarResultado(resultadoAceptado);
       tResultadoPendiente = millis();
     } else if (lecturaPendiente) {
       publicarLectura(colorPendiente);
@@ -458,9 +477,15 @@ void setup() {
   cargarConfiguracionRed();
 
   Wire.begin(LCD_SDA, LCD_SCL);
-  lcd.begin(16, 2);
-  lcd.backlight();
-  actualizarLCD();
+  int estadoLcd = lcd.begin(16, 2);
+  if (estadoLcd == 0) {
+    lcdDisponible = true;
+    lcd.backlight();
+    actualizarLCD();
+  } else {
+    Serial.printf("LCD I2C no disponible (codigo %d); el clasificador continuara sin pantalla.\n",
+                  estadoLcd);
+  }
 
   pinMode(S0, OUTPUT);
   pinMode(S1, OUTPUT);
@@ -547,7 +572,7 @@ void loop() {
     tLecturaPendiente = millis();
   }
   if (mqtt.connected() && resultadoPendiente && millis() - tResultadoPendiente >= 5000) {
-    if (publicarResultado(resultadoAceptado)) completarPublicacionResultado();
+    publicarResultado(resultadoAceptado);
     tResultadoPendiente = millis();
   }
 
@@ -572,4 +597,6 @@ void loop() {
     tEstado = millis();
     publicarEstado();
   }
+}
+
 }
